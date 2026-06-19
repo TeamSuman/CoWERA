@@ -218,79 +218,105 @@ class Calculate_Distances:
 
     # --------------------------- phase per walker ------------------------- #
 
-    def phase_calculation(self, i, path, n_d, n_bins=100):
-        import ruptures as rpt
+    def _load_projection(self, i, path, frame_slice=None):
+        """Load a walker's trajectory and project it onto the progress coordinate.
 
+        Returns ``(projection, drange)``. If ``frame_slice`` is given it is
+        applied to the trajectory before projection so that only the requested
+        (e.g. newly produced) frames are projected -- avoiding re-projection of
+        the entire accumulated history every cycle.
+        """
         if self._feat == "best_hummer_q":
+            traj = f"{path}walker_{i}.dcd"
+            if frame_slice is not None:
+                import mdtraj as md
+                traj = md.load(traj, top=self.native_file)[frame_slice]
             projection, drange = best_hummer_q(
-                traj=f"{path}walker_{i}.dcd",
+                traj=traj,
                 native_file=self.native_file,
                 init_file=self.init_file,
             )
         elif self._feat == "rmsd_backbone":
-            if self.increment == 1:
-                projection, drange = RMSD_Backbone(
-                    traj=f"{path}walker_{i}.dcd",
-                    init_file=self.init_file,
-                    unfolded_file=self.tar_file,
-                    top_file=self.top_file
-                )
-            else:
-                projection, drange = RMSD_Backbone(
-                    traj=f"{path}walker_{i}.dcd",
-                    init_file=self.init_file,
-                    unfolded_file=self.init_file,
-                    top_file=self.top_file
-                )
+            traj = f"{path}walker_{i}.dcd"
+            if frame_slice is not None:
+                import mdtraj as md
+                traj = md.load(traj, top=self.top_file)[frame_slice]
+            unfolded = self.tar_file if self.increment == 1 else self.init_file
+            projection, drange = RMSD_Backbone(
+                traj=traj,
+                init_file=self.init_file,
+                unfolded_file=unfolded,
+                top_file=self.top_file,
+            )
         else:
             raise ValueError(f"Unrecognized feature selection: {self._feat}")
+        return projection, drange
 
-        if len(projection) == 1:
-            # Walker was warped this cycle.
-            return np.zeros(n_d), 0.0, projection[0]
+    def project_new_frames(self, i, path, offset):
+        """Project only the frames produced since ``offset`` for walker ``i``.
 
-        drange = drange[::self.increment]
+        Returns ``(new_projection, drange, total_frames, was_reset)``. A reset
+        (the trajectory now has fewer frames than were previously consumed, e.g.
+        after a warp recreated the file) is reported so the caller can clear the
+        stale in-memory history. This is the seam that Phase 3 will replace with
+        CV values produced inline by the runner, removing the disk read entirely.
+        """
+        from cowera.cv_history import incremental_window
 
-        # Fast changepoints
+        full, drange = self._load_projection(i, path)
+        n_frames = len(full)
+        was_reset, start, total = incremental_window(offset, n_frames)
+        return np.asarray(full[start:]), drange, total, was_reset
+
+    def phase_from_projection(self, projection, drange, n_d, n_bins=100):
+        """Compute ``(bins, phase, weight)`` from an in-memory CV series.
+
+        Pure analysis (no disk I/O). Implements the relevant-history /
+        phase calculation of Appendix B/C with NaN-safe helpers.
+        """
+        import ruptures as rpt
+
+        projection = np.asarray(projection, dtype=float)
+
+        if len(projection) <= 1:
+            # Walker was warped this cycle (no meaningful history).
+            return np.zeros(n_d), 0.0, projection[0] if len(projection) else 0.0
+
+        drange = np.asarray(drange)[::self.increment]
+
+        # Fast changepoints over the (in-memory) accumulated history.
         algo = rpt.KernelCPD(kernel="linear", min_size=2).fit(projection)
         changes = np.array(algo.predict(pen=0.01))
         change_points = relevant_change_points(changes, n_d)
 
-        # Weight (normalized projection assumed)
         weight = projection[-1]
 
         bin_edges = self.get_bin_edges(x_min=drange[0], x_max=drange[1], n_bins=n_bins)
-
-        # Digitize instead of loop
         current_bins = np.digitize(projection, bin_edges, right=True)
 
-        # Phase over the most recent relevant segment (NaN-safe).
         seg = current_bins[change_points[-2]:change_points[-1]]
         phase = phase_from_bins(seg)
 
         return current_bins[-n_d:], phase, weight
 
+    def phase_calculation(self, i, path, n_d, n_bins=100):
+        """Disk-based compatibility wrapper: load the trajectory then analyze."""
+        projection, drange = self._load_projection(i, path)
+        if len(projection) == 1:
+            return np.zeros(n_d), 0.0, projection[0]
+        return self.phase_from_projection(projection, drange, n_d, n_bins)
+
     # ----------------------------- intensity ------------------------------ #
 
-    def intensity_calculation(self, n_walkers, path, n_d, it,
+    def intensity_from_phases(self, bins_list, phase_arr, weight_arr, n_walkers, it,
                               n_bins=100, max_bins=125,
-                              bin_increase_factor=1.2, bin_decrease_factor=0.8,
-                              n_jobs=-1):
-        """
-        Compute new weights (intensities) for walkers based on collective motion
-        and phase, and adjust bin resolution based on collective bin movement.
-        """
-        # Per-walker phase calculation parallelized across CPU cores. mdtraj
-        # releases the GIL during heavy numerical work so the threading backend
-        # avoids pickling the (file-path based) work while still overlapping.
-        results = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(self.phase_calculation)(i, path, n_d, n_bins)
-            for i in range(n_walkers)
-        )
-        bins_list = [r[0] for r in results]
-        phase_arr = [r[1] for r in results]
-        weight_arr = [r[2] for r in results]
+                              bin_increase_factor=1.2, bin_decrease_factor=0.8):
+        """Combine per-walker (bins, phase, weight) into normalized intensities.
 
+        Pure-numpy (no disk / changepoint); shared by the in-memory and
+        disk-based code paths. Also performs the adaptive bin adjustment
+        (Appendix F) and returns the (possibly) updated ``n_bins``.
+        """
         bins_arr = np.array(bins_list, dtype=float)
 
         if (bins_arr == 0).all():
@@ -300,11 +326,9 @@ class Calculate_Distances:
         phases = np.array(phase_arr, dtype=float)
         weights = np.array(weight_arr, dtype=float)
 
-        # Scaled initial intensity I0 (direction-aware) and scaled phase.
         weights_scaled = scale_weights(weights, self.increment)
         phases_scaled = scale_phases(phases)
 
-        # Adaptive bin adjustment based on the fraction of unique bins visited.
         fraction_unique = np.mean([
             len(np.unique(bins_arr[i])) / bins_arr.shape[1]
             for i in range(bins_arr.shape[0])
@@ -315,5 +339,39 @@ class Calculate_Distances:
             n_bins = max(10, int((n_bins - 1) * bin_decrease_factor))
 
         intensity = compute_intensity(weights_scaled, phases_scaled)
-
         return intensity, n_bins
+
+    def intensity_from_projections(self, projections, dranges, n_d, it,
+                                   n_bins=100, max_bins=125, n_jobs=-1):
+        """Compute intensities directly from in-memory CV histories.
+
+        This is the disk-free analysis path used by the resampler: it consumes
+        the accumulated per-walker projection arrays maintained by
+        :class:`cowera.cv_history.CVHistory` instead of re-reading DCD files.
+        """
+        n_walkers = len(projections)
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(self.phase_from_projection)(projections[i], dranges[i], n_d, n_bins)
+            for i in range(n_walkers)
+        )
+        bins_list = [r[0] for r in results]
+        phase_arr = [r[1] for r in results]
+        weight_arr = [r[2] for r in results]
+        return self.intensity_from_phases(bins_list, phase_arr, weight_arr,
+                                           n_walkers, it, n_bins, max_bins)
+
+    def intensity_calculation(self, n_walkers, path, n_d, it,
+                              n_bins=100, max_bins=125,
+                              bin_increase_factor=1.2, bin_decrease_factor=0.8,
+                              n_jobs=-1):
+        """Disk-based compatibility wrapper (kept for the legacy code path)."""
+        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+            delayed(self.phase_calculation)(i, path, n_d, n_bins)
+            for i in range(n_walkers)
+        )
+        bins_list = [r[0] for r in results]
+        phase_arr = [r[1] for r in results]
+        weight_arr = [r[2] for r in results]
+        return self.intensity_from_phases(bins_list, phase_arr, weight_arr,
+                                           n_walkers, it, n_bins, max_bins,
+                                           bin_increase_factor, bin_decrease_factor)

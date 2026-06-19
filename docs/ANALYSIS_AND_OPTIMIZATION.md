@@ -116,18 +116,41 @@ vectorized `pairwise_distance_matrix` and the intensity calculation directly.
 
 ---
 
-## 4. Roadmap — staged HPC / multi-GPU work (next phases)
+## 4. Phase 2 (landed) — in-memory CV history
 
-These are higher-impact but require validation on real GPU hardware and are
-therefore staged as follow-up PRs.
+The runner writes each walker's trajectory to `walker_{i}.dcd` and the resampler
+previously re-read **and re-projected the entire accumulated trajectory** from
+disk for every walker every cycle in `phase_calculation` — an O(T) disk read,
+O(T) re-projection and O(T²) changepoint cost that grows as histories lengthen.
 
-### Phase 2 — In-memory CV history (remove the DCD disk round-trip)
-The runner writes each walker's trajectory to `walker_{i}.dcd`, and the
-resampler reads it back from disk every walker every cycle in
-`phase_calculation`. Carry the per-walker progress-coordinate time series in
-memory and reindex it on clone/merge (mirroring `file_resampler`), keeping DCD
-writes only for final productive-trajectory archival. This also removes the
-stale-file fragility in `file_resampler.update_dcd_files`.
+Phase 2 introduces `cowera/cv_history.py::CVHistory`, an in-memory per-walker CV
+time series that is updated **incrementally**:
+
+- `extend` appends only the frames produced in the latest segment (so the Q/RMSD
+  projection cost per cycle drops from O(T) to O(segment));
+- `reindex` reorganizes histories under clone/merge by array reassignment,
+  mirroring `file_resampler.update_dcd_files` semantics in memory (decoupling the
+  resampling analysis from the trajectory-file bookkeeping);
+- warp resets are detected via frame-count (`incremental_window`) and clear the
+  stale history;
+- an optional `history_window` bounds the retained history, capping the
+  changepoint cost (an algorithmic improvement over unbounded growth).
+
+The analysis is decoupled from I/O: `metric.phase_from_projection` /
+`intensity_from_projections` operate purely on in-memory arrays, while the legacy
+disk methods (`phase_calculation` / `intensity_calculation`) remain as
+compatibility wrappers. The resampler uses the in-memory path by default
+(`use_cv_history=True`; set `False` to restore the legacy path).
+
+`CVHistory`, `incremental_window` and the reindex logic are pure-numpy and
+unit-tested (`Scripts/tests/test_cv_history.py`). The remaining disk read of the
+*new* segment is the final seam removed in Phase 3 (runner-supplied CVs).
+
+> Validation note: the `CVHistory` building blocks are unit-tested here, but the
+> integrated resampler path requires the full MD stack + GPU and must be
+> validated on the simulation host before this phase is merged to `main`.
+
+## 5. Roadmap — remaining HPC / multi-GPU work (next phases)
 
 ### Phase 3 — Persistent per-GPU workers + cached OpenMM Context
 The current `TaskMapper` forks a fresh process **and builds a new OpenMM
@@ -150,7 +173,7 @@ Also trim `GET_STATE_KWARG_DEFAULTS` to fetch only positions + box vectors
 
 ---
 
-## 5. Running the tests & benchmarks
+## 6. Running the tests & benchmarks
 
 The Phase-1 algorithm cores are pure NumPy and run without a GPU or the MD stack:
 
