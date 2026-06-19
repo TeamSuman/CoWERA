@@ -24,6 +24,11 @@ from cowera_committor.committor_data import (
     SemigroupBuffer,
     ShootingBuffer,
 )
+from cowera_committor.committor_metric import (
+    CommittorDistances,
+    augment_merge_distance,
+    committor_displacement,
+)
 
 __all__ = [
     "IdentityFeaturizer",
@@ -33,4 +38,7 @@ __all__ = [
     "BoundaryBuffer",
     "SemigroupBuffer",
     "ShootingBuffer",
+    "CommittorDistances",
+    "augment_merge_distance",
+    "committor_displacement",
 ]

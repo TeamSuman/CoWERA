@@ -64,7 +64,7 @@ committor path will subclass `Calculate_Distances` / `CoWERAResampler`.
 
 ### M1 validation (CPU, no GPU/MD)
 
-`Scripts/tests/test_committor_*.py` (38 tests in the suite total):
+`Scripts/tests/test_committor_*.py` (58 tests in the suite total):
 
 - **Finite-difference gradient check** — analytic gradients match numerical
   gradients for all loss terms (guarantees the manual backprop is correct).
@@ -105,6 +105,45 @@ walkers are cloned:
 Other figures: `committor_doublewell_system.png`, `committor_training_data.png`,
 `committor_loss.png`.
 
+## Milestone M2 (implemented) — Δq resampling path
+
+`Scripts/cowera_committor/committor_metric.py` provides
+`CommittorDistances(Calculate_Distances)`, which makes the committor the live
+resampling criterion. Because the Phase-2 refactor decoupled the analysis from
+the projection source, **this is a drop-in: no change to `resampler.py`**.
+
+- **Projection → q:** `get_proj_coord` / `_load_projection` / `project_new_frames`
+  run model inference (`featurizer → model.predict_batch`) so each walker frame's
+  committor `q` is produced and stored in the existing `CVHistory` exactly as a
+  geometric CV was.
+- **Continuous Δq phase:** `phase_from_projection` returns the committor
+  displacement `Δq = q(T) − q(T−τ_i)` over the relevant history window (reusing
+  `detect_changepoints` + `relevant_change_points`) instead of the sign-based
+  phase. The unchanged `intensity_from_projections` / `scale_phases` /
+  `compute_intensity` then map `Δq → intensity` (Δq strictly generalizes
+  `np.sign(np.diff(...))`).
+- **Committor-augmented merge:** `pairwise_distance_matrix` returns
+  `D_ij = α·D_RMSD + (1−α)·|q_i − q_j|` (`merge_alpha`, default 0.7), with the
+  vector-committor L1 generalization already in `augment_merge_distance`.
+
+Wiring it into CoWERA (sketch):
+
+```python
+from cowera_committor import CommittorDistances, MLPCommittor, DistanceFeaturizer
+from cowera.resampler import CoWERAResampler
+
+dist = CommittorDistances(committor_model=model, featurizer=feat,
+                          increment=1, merge_alpha=0.7,
+                          native_file=native_path, top_file=native_path)
+resampler = CoWERAResampler(distance=dist, init_state=walker_state,
+                            merge_dist=d_merge, increment=1, ...)  # unchanged
+```
+
+Pure helpers (`augment_merge_distance`, `committor_displacement`) and the Δq
+phase / intensity path are unit-tested with an injected changepoint function and
+synthetic committor histories — no ruptures/mdtraj/GPU required
+(`Scripts/tests/test_committor_metric.py`).
+
 ## Cold-start protocol (designed; staged for M3+)
 
 `BootstrapPhaseManager` will drive the four-phase bootstrap that needs **no
@@ -124,10 +163,9 @@ already does for adaptive binning) is valid.
 
 ## Roadmap (next milestones)
 
-- **M2** — `committor_metric.py`: `Δq` intensity path reusing
-  `intensity_from_projections`; `CVHistory` keyed on `q`.
-- **M3** — `committor_resampler.py` + `phase_manager.py` (Phase 0/1) +
-  committor-augmented merge distance; opt-in via `config_committor.yml`.
+- **M3** — `committor_resampler.py` + `phase_manager.py` (Phase 0/1) cold-start
+  state machine + retraining hooks; opt-in via `config_committor.yml` and a
+  `run_cowera_committor.py` entry point.
 - **M4** — reactive-fragment harvest + shooting interfaces (depends on the
   runner CV/burst hook from performance Phase 3).
 - **Stage 2+** — GVP-GNN backend (torch-geometric) behind `CommittorModel`;

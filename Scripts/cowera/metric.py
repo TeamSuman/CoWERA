@@ -69,6 +69,19 @@ def compute_intensity(weights_scaled, phases_scaled):
     return interference / imax
 
 
+def detect_changepoints(projection, pen=0.01, min_size=2):
+    """Kernel changepoint detection on a 1D series (ruptures KernelCPD).
+
+    Extracted so the committor extension can reuse it (and so tests can inject a
+    cheap substitute without the optional ``ruptures`` dependency).
+    """
+    import ruptures as rpt
+
+    projection = np.asarray(projection, dtype=float)
+    algo = rpt.KernelCPD(kernel="linear", min_size=min_size).fit(projection)
+    return np.array(algo.predict(pen=pen))
+
+
 def relevant_change_points(changes, n_d):
     """Build the segment boundaries used for the phase calculation (Appendix B).
 
@@ -274,8 +287,6 @@ class Calculate_Distances:
         Pure analysis (no disk I/O). Implements the relevant-history /
         phase calculation of Appendix B/C with NaN-safe helpers.
         """
-        import ruptures as rpt
-
         projection = np.asarray(projection, dtype=float)
 
         if len(projection) <= 1:
@@ -285,8 +296,7 @@ class Calculate_Distances:
         drange = np.asarray(drange)[::self.increment]
 
         # Fast changepoints over the (in-memory) accumulated history.
-        algo = rpt.KernelCPD(kernel="linear", min_size=2).fit(projection)
-        changes = np.array(algo.predict(pen=0.01))
+        changes = detect_changepoints(projection)
         change_points = relevant_change_points(changes, n_d)
 
         weight = projection[-1]
