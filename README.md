@@ -300,6 +300,29 @@ This file contains:
 
 ---
 
+# 📚 Documentation
+
+Additional documentation lives in `docs/`:
+
+- [`docs/ANALYSIS_AND_OPTIMIZATION.md`](docs/ANALYSIS_AND_OPTIMIZATION.md) — code
+  analysis, bug fixes, and multi-GPU performance optimization (with the in-memory
+  CV-history refactor).
+- [`docs/REPRODUCING_THE_PAPER.md`](docs/REPRODUCING_THE_PAPER.md) — Table I
+  parameter mapping and example configs to reproduce the chignolin / Trp-cage
+  kinetics (Tables II–III).
+- [`docs/COMMITTOR_EXTENSION.md`](docs/COMMITTOR_EXTENSION.md) — the opt-in
+  **committor-based** resampling extension (`Scripts/cowera_committor/`), with a
+  validated tutorial notebook,
+  [`Analysis/CoWERA_Committor_Tutorial.ipynb`](Analysis/CoWERA_Committor_Tutorial.ipynb).
+
+Run the CPU test suite (no GPU/MD stack required):
+
+```bash
+python -m pytest Scripts/tests/ -v
+```
+
+---
+
 # 📌 Summary
 
 CoWERA provides:
