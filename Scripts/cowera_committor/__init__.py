@@ -28,7 +28,22 @@ from cowera_committor.committor_metric import (
     CommittorDistances,
     augment_merge_distance,
     committor_displacement,
+    suppress_tse_merges,
 )
+from cowera_committor.phase_manager import (
+    BootstrapPhaseManager,
+    STRUCTURAL, SEMIGROUP, SHOOTING, MATURE,
+)
+from cowera_committor.bootstrap import structural_interpolants
+from cowera_committor.committor_train import (
+    extract_segment_training_data,
+    assemble_training_data,
+    retrain_committor,
+)
+
+# NOTE: ``CommittorResampler`` is intentionally not imported here because it
+# depends on the ``wepy`` stack. Import it directly where that stack is present:
+#     from cowera_committor.committor_resampler import CommittorResampler
 
 __all__ = [
     "IdentityFeaturizer",
@@ -41,4 +56,11 @@ __all__ = [
     "CommittorDistances",
     "augment_merge_distance",
     "committor_displacement",
+    "suppress_tse_merges",
+    "BootstrapPhaseManager",
+    "STRUCTURAL", "SEMIGROUP", "SHOOTING", "MATURE",
+    "structural_interpolants",
+    "extract_segment_training_data",
+    "assemble_training_data",
+    "retrain_committor",
 ]

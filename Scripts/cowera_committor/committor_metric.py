@@ -54,6 +54,27 @@ def augment_merge_distance(d_rmsd, q, alpha):
     return alpha * d_rmsd + (1.0 - alpha) * dq
 
 
+def suppress_tse_merges(D, q, band, q_center=0.5):
+    """Make merges involving near-transition-state walkers impossible.
+
+    Sets ``D_ij = inf`` whenever walker ``i`` or ``j`` has a committor within
+    ``band`` of ``q_center`` (=0.5). This implements the cold-start protocol's
+    "conservative merge near q=0.5": while the committor is unreliable, walkers
+    near the (precious) transition state are never merged away. ``band == 0``
+    leaves ``D`` unchanged.
+    """
+    D = np.array(D, dtype=float, copy=True)
+    if band <= 0:
+        return D
+    q = np.asarray(q, dtype=float)
+    near = np.abs(q - q_center) < band
+    if near.any():
+        D[near, :] = np.inf
+        D[:, near] = np.inf
+        np.fill_diagonal(D, 0.0)
+    return D
+
+
 def committor_displacement(q_series, change_points):
     """Continuous committor displacement over the relevant history window.
 
@@ -72,7 +93,7 @@ def committor_displacement(q_series, change_points):
 
 class CommittorDistances(Calculate_Distances):
     def __init__(self, committor_model, featurizer,
-                 increment=1, merge_alpha=0.7,
+                 increment=1, merge_alpha=0.7, merge_band=0.0,
                  distance_criterion="pairwise_rmsd",
                  changepoint_fn=None, **kwargs):
         """
@@ -83,6 +104,10 @@ class CommittorDistances(Calculate_Distances):
         merge_alpha : float in [0, 1]
             Weight of geometric RMSD vs. committor proximity in the merge
             distance (1.0 = pure RMSD, 0.0 = pure committor).
+        merge_band : float
+            No-action half-width around q=0.5; merges involving walkers within
+            this band are suppressed (cold-start "conservative merge"). Updated
+            per cycle by the phase manager. 0.0 disables.
         changepoint_fn : callable or None
             Override for changepoint detection (defaults to
             ``cowera.metric.detect_changepoints``); injectable for testing.
@@ -92,6 +117,7 @@ class CommittorDistances(Calculate_Distances):
         self.model = committor_model
         self.featurizer = featurizer
         self.merge_alpha = float(merge_alpha)
+        self.merge_band = float(merge_band)
         self._changepoint_fn = changepoint_fn
 
     # --------------------------- inference -------------------------------- #
@@ -111,6 +137,21 @@ class CommittorDistances(Calculate_Distances):
         pos = np.asarray(state['positions'], dtype=float)
         frames = pos[None, ...] if pos.ndim == 2 else pos
         return self.predict_q(frames)
+
+    def load_frames(self, i, path):
+        """Load a walker's trajectory frames as an (T, n_atoms, 3) array.
+
+        Returns ``None`` if the file is missing (e.g. just after a warp). Used by
+        the resampler to harvest training data. Requires mdtraj.
+        """
+        import mdtraj as md
+
+        top = self.top_file or self.native_file
+        try:
+            traj = md.load(f"{path}walker_{i}.dcd", top=top)
+        except Exception:
+            return None
+        return traj.xyz
 
     def _load_projection(self, i, path, frame_slice=None):
         """Load walker frames and project them onto the committor (range [0,1])."""
@@ -151,9 +192,11 @@ class CommittorDistances(Calculate_Distances):
 
     # ----------------------- committor merge dist ------------------------- #
     def pairwise_distance_matrix(self, walkers):
-        """Committor-augmented merge distance matrix."""
+        """Committor-augmented merge distance matrix (with optional TSE band)."""
         d_rmsd = super().pairwise_distance_matrix(walkers)
-        if self.merge_alpha >= 1.0:
-            return d_rmsd
         q = np.array([self.predict_q_state(w.state) for w in walkers])
-        return augment_merge_distance(d_rmsd, q, self.merge_alpha)
+        if self.merge_alpha < 1.0:
+            D = augment_merge_distance(d_rmsd, q, self.merge_alpha)
+        else:
+            D = d_rmsd
+        return suppress_tse_merges(D, q, self.merge_band)

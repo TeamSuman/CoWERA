@@ -11,7 +11,23 @@ from cowera_committor.committor_metric import (
     CommittorDistances,
     augment_merge_distance,
     committor_displacement,
+    suppress_tse_merges,
 )
+
+
+def test_suppress_tse_merges_blocks_near_transition_state():
+    D = np.ones((3, 3)) - np.eye(3)
+    q = np.array([0.05, 0.5, 0.95])   # walker 1 is at the TSE
+    out = suppress_tse_merges(D, q, band=0.2)
+    assert np.isinf(out[1, 0]) and np.isinf(out[0, 1])  # any pair with walker 1
+    assert np.isinf(out[1, 2])
+    assert out[0, 2] == 1.0           # pair not involving the TSE walker is finite
+    assert out[1, 1] == 0.0           # diagonal preserved
+
+
+def test_suppress_tse_merges_band_zero_is_noop():
+    D = np.array([[0.0, 1.0], [1.0, 0.0]])
+    assert np.allclose(suppress_tse_merges(D, np.array([0.4, 0.6]), band=0.0), D)
 from cowera_committor.committor_model import MLPCommittor
 from cowera_committor.featurizer import DistanceFeaturizer
 

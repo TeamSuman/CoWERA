@@ -1,0 +1,74 @@
+# ===============================================================
+# 🧬 CoWERA-Committor Input File (opt-in committor extension)
+# ===============================================================
+# Extends the standard CoWERA config (see config_template.yml) with a
+# `committor:` block. When committor.enabled is true, the learned committor
+# q(x) becomes the resampling progress coordinate (replacing Q / RMSD), trained
+# on-the-fly via the cold-start bootstrap protocol.
+#
+# Launch:
+#     python Scripts/run_cowera_committor.py --config <this file>
+# ===============================================================
+
+# ---- standard CoWERA parameters (see config_template.yml) ----
+system: "Trp-cage"
+dir: "./Systems/TC10b Trp-cage"
+num_walkers: 16
+pmax: 0.25
+run: "committor_0"
+n_steps: 50000
+n_cycles: 20000
+save_freq: 5000
+
+start: "unfolded.gro"
+topol: "topol.top"
+target: "folded.gro"
+native: "folded.gro"
+
+# committor q is defined toward the target B, so increment is +1
+increment: 1
+mode: "probabilistic"
+distance_criterion: "pairwise_rmsd"
+d_merge: 0.6
+d_warped: 0.3
+temp: 290.0
+gpu_ids: [0]
+n_bins: 122
+max_bins: 122
+output_folder: "committor_runs"
+
+# ===============================================================
+# 🤖 COMMITTOR EXTENSION
+# ===============================================================
+committor:
+  enabled: true
+
+  # --- featurization ---
+  # "native_contacts": SE(3)-invariant heavy-atom native-contact distances
+  #                    (pairs taken from the native structure).
+  featurizer: "native_contacts"
+  contact_cutoff: 0.45        # nm; native-contact definition
+
+  # --- model (near-term: dependency-free MLP) ---
+  hidden_layers: [64, 64]
+  l2: 1.0e-5
+
+  # --- cold-start bootstrap schedule ---
+  warmup_cycles: 20           # cycles before committor training begins
+  retrain_interval: 10        # cycles between retraining rounds
+  retrain_epochs: 200
+  learning_rate: 5.0e-3
+
+  # --- phase-manager thresholds ---
+  basin_a_cutoff: 0.1
+  basin_b_cutoff: 0.9
+  var_threshold: 0.05         # phase 1 -> 2 (variance of q on intermediates)
+  min_intermediate_pairs: 50
+  hist_mean_tol: 0.1          # phase 2 -> 3 (committor histogram test)
+  hist_std_tol: 0.15
+  required_consecutive: 3
+
+  # --- resampling ---
+  merge_alpha: 0.7            # weight of RMSD vs |q_i - q_j| in merge distance
+  semigroup_buffer_size: 10000
+  shooting_buffer_size: 2000

@@ -23,10 +23,13 @@ def _make_data(rng, F=3):
     Xs = rng.standard_normal((3, F))
     nA = rng.integers(0, 5, size=3).astype(float)
     nB = rng.integers(0, 5, size=3).astype(float)
+    Xi = rng.standard_normal((4, F))
+    yi = rng.uniform(0.1, 0.9, size=4)
     return {
         'A': A, 'B': B, 'wA': rng.uniform(0.5, 1.5, 5), 'wB': rng.uniform(0.5, 1.5, 4),
         'sem': (Xt, Xtp, ws),
         'shoot': (Xs, nA, nB, rng.uniform(0.5, 1.5, 3)),
+        'interp': (Xi, yi, rng.uniform(0.5, 1.5, 4)),
     }
 
 
@@ -35,7 +38,7 @@ def test_gradient_check_finite_difference():
     rng = np.random.default_rng(1)
     model = MLPCommittor(input_dim=3, hidden=(5, 4), seed=2)
     data = _make_data(rng)
-    weights = {'boundary': 1.0, 'semigroup': 1.0, 'aimmd': 1.0,
+    weights = {'boundary': 1.0, 'semigroup': 1.0, 'aimmd': 1.0, 'interpolant': 1.0,
                'lambda_A': 1.0, 'lambda_B': 1.0}
 
     theta0 = model.get_params_flat().copy()

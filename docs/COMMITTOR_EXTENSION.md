@@ -64,7 +64,7 @@ committor path will subclass `Calculate_Distances` / `CoWERAResampler`.
 
 ### M1 validation (CPU, no GPU/MD)
 
-`Scripts/tests/test_committor_*.py` (58 tests in the suite total):
+`Scripts/tests/test_committor_*.py` (87 tests in the suite total):
 
 - **Finite-difference gradient check** — analytic gradients match numerical
   gradients for all loss terms (guarantees the manual backprop is correct).
@@ -144,15 +144,47 @@ phase / intensity path are unit-tested with an injected changepoint function and
 synthetic committor histories — no ruptures/mdtraj/GPU required
 (`Scripts/tests/test_committor_metric.py`).
 
-## Cold-start protocol (designed; staged for M3+)
+## Milestone M3 (implemented) — cold-start bootstrap & on-the-fly training
 
-`BootstrapPhaseManager` will drive the four-phase bootstrap that needs **no
-reactive trajectories**:
+The committor is trained **during** the run from a cold start (no reactive
+trajectories). `Scripts/cowera_committor/`:
 
-- **Phase 0** structural interpolants (no MD) → coarse `q⁰`;
-- **Phase 1** semigroup training on WE segment pairs (conservative merge);
-- **Phase 2** shooting-point AIMMD from first reactive fragments (histogram test);
-- **Phase 3** mature self-consistent training (sliding window, JSD convergence).
+- **`phase_manager.py`** — `BootstrapPhaseManager`, the cold-start state machine.
+  It tracks the phase, decides when to advance (quality/exit criteria), and
+  emits the per-phase **loss weights**, **conservative-merge band**, **retrain
+  timing**, and **data routing** — all pure-Python and unit-tested.
+  - **Phase 0 (structural):** A↔B interpolants (no MD) → coarse `q⁰`;
+  - **Phase 1 (semigroup):** variational training on WE segment pairs; conservative
+    merges; exit when `var(q)` on intermediates exceeds threshold for N retrains;
+  - **Phase 2 (shooting):** AIMMD; exit on the committor histogram test;
+  - **Phase 3 (mature):** full guidance, normal merges.
+- **`bootstrap.py`** — `structural_interpolants`: linear A↔B interpolants with
+  soft labels `y = 1−α` (optional injected relaxation).
+- **`committor_train.py`** — `extract_segment_training_data` (per-frame routing to
+  boundary / semigroup buffers), `assemble_training_data`, and `retrain_committor`
+  (phase-aware loss weights).
+- **`committor_metric.py`** — `suppress_tse_merges` implements the conservative
+  band (merges involving near-TSE walkers are blocked while `q` is unreliable).
+- **`committor_resampler.py`** — `CommittorResampler(CoWERAResampler)`: thin
+  orchestration that collects per-cycle training data, retrains on schedule, and
+  advances the phase. Plus `config_committor.yml` and `run_cowera_committor.py`.
+
+**Cold-start on the double well** (tutorial §6): `q` sharpens from the coarse
+structural seed (Phase 0, MAE ≈ 0.06) to the true committor once dynamical
+semigroup data arrives (Phase 1, MAE ≈ 0.02):
+
+![Cold-start](figures/committor_coldstart.png)
+
+The state machine, structural bootstrap, per-frame routing, and end-to-end
+retraining are unit-tested (`test_committor_phase_manager.py`,
+`test_committor_bootstrap.py`, `test_committor_train.py`). The
+`CommittorResampler` glue (which loads frames / featurizes) requires the MD stack
+and is validated on the simulation host.
+
+### Earlier four-phase protocol summary
+The bootstrap needs **no reactive trajectories**: Phase 0 structural interpolants
+→ Phase 1 semigroup on WE segment pairs → Phase 2 shooting-point AIMMD from the
+first reactive fragments → Phase 3 mature self-consistent training.
 
 ## Statistical validity
 
@@ -163,9 +195,10 @@ already does for adaptive binning) is valid.
 
 ## Roadmap (next milestones)
 
-- **M3** — `committor_resampler.py` + `phase_manager.py` (Phase 0/1) cold-start
-  state machine + retraining hooks; opt-in via `config_committor.yml` and a
-  `run_cowera_committor.py` entry point.
+- **M4 / Phase 2** — shooting-point (AIMMD) augmentation: harvest reactive
+  fragments at first B-touch, launch short forward/backward bursts near `q≈0.5`,
+  and add the outcomes to the `ShootingBuffer`. Needs the runner CV/burst hook
+  (performance Phase 3).
 - **M4** — reactive-fragment harvest + shooting interfaces (depends on the
   runner CV/burst hook from performance Phase 3).
 - **Stage 2+** — GVP-GNN backend (torch-geometric) behind `CommittorModel`;

@@ -154,7 +154,7 @@ class MLPCommittor(CommittorModel):
         ``weights`` overrides the loss-term weights
         {'boundary','semigroup','aimmd','lambda_A','lambda_B'}.
         """
-        w = {'boundary': 1.0, 'semigroup': 1.0, 'aimmd': 0.0,
+        w = {'boundary': 1.0, 'semigroup': 1.0, 'aimmd': 0.0, 'interpolant': 0.0,
              'lambda_A': 1.0, 'lambda_B': 1.0}
         if weights:
             w.update(weights)
@@ -219,6 +219,20 @@ class MLPCommittor(CommittorModel):
             dq = (w['aimmd'] * ws * (nA / (1 - qs) - nB / qs) / n)[:, None]
             gWs, gbs = self._backward(cs, dq)
             self._accumulate(gW, gb, gWs, gbs)
+
+        # ---- structural interpolant soft labels (Phase 0 bootstrap) ----
+        if w['interpolant'] > 0 and data.get('interp') is not None and len(data['interp'][0]) > 0:
+            Xi, yi, wi = data['interp']
+            Xi = np.atleast_2d(Xi)
+            yi = np.asarray(yi, float)
+            wi = np.ones(len(Xi)) if wi is None else np.asarray(wi, float)
+            n = len(Xi)
+            qi, ci = self._forward(Xi)
+            qi = qi.ravel()
+            loss += w['interpolant'] * np.mean(wi * (qi - yi) ** 2)
+            dq = (w['interpolant'] * 2.0 * wi * (qi - yi) / n)[:, None]
+            gWi, gbi = self._backward(ci, dq)
+            self._accumulate(gW, gb, gWi, gbi)
 
         # ---- L2 regularization ----
         if self.l2 > 0:
