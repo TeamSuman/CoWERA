@@ -23,3 +23,6 @@ htmlcov/
 **/simdata_run*/
 *.h5
 *.dcd
+
+# Session artifacts (delivered to the user, not tracked in-repo)
+CoWERA_session_transcript*.pdf
