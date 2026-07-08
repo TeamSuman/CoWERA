@@ -133,6 +133,14 @@ checkpoint_freq = getattr(args, "checkpoint_freq", 10)
 scratch_dir    = getattr(args, "scratch_dir", None)
 seed           = getattr(args, "seed", None)
 deterministic_dynamics = getattr(args, "deterministic_dynamics", False)
+# Reporters save only positions + box_vectors; velocities are retained for state
+# fidelity across clone/merge/warp. Forces/energy/parameters/derivatives are
+# fetched every segment but discarded, so trim them by default to cut GPU->CPU
+# transfer. Config `getstate_kwargs` can override (e.g. to keep forces).
+_DEFAULT_GETSTATE = {'getPositions': True, 'getVelocities': True,
+                     'getForces': False, 'getEnergy': False,
+                     'getParameters': False, 'getParameterDerivatives': False}
+getstate_kwargs = getattr(args, "getstate_kwargs", None) or _DEFAULT_GETSTATE
 platform_name  = getattr(args, "platform", "CUDA")
 platform_kwargs = getattr(args, "platform_kwargs", None)
 _GPU_PLATFORMS = ("CUDA", "OpenCL")
@@ -371,7 +379,8 @@ if __name__ == "__main__":
     # (which re-randomizes each segment).
     runner = OpenMMRunner(system, top.topology, integrator, platform=platform_name,
                           platform_kwargs=platform_kwargs, dcd_folder=dcd_folder, save_freq=save_freq,
-                          random_seed=(seed if deterministic_dynamics else None))
+                          random_seed=(seed if deterministic_dynamics else None),
+                          getState_kwargs=getstate_kwargs)
 
     # Select the feature
     sel_feat = sel_feat

@@ -179,6 +179,13 @@ gpu_ids: [0, 0, 0, 0, 0]
 # Frequency (MD steps) to save trajectory data
 save_freq: 5000
 
+# Advanced: which OpenMM state fields to pull off the GPU each segment. Default
+# (positions + velocities only) minimizes GPU->CPU transfer since reporters save
+# just positions + box. Override only if you need e.g. forces/energy saved:
+#   getstate_kwargs: {getPositions: true, getVelocities: true, getForces: true,
+#                     getEnergy: true, getParameters: false, getParameterDerivatives: false}
+getstate_kwargs: null
+
 # Number of bins for progress coordinate discretization
 n_bins: 122
 

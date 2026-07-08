@@ -125,6 +125,7 @@ class OpenMMRunner(Runner):
                  dcd_folder=None,
                  save_freq=1,
                  random_seed=None,
+                 getState_kwargs=None,
                  enforce_box=False):
         """Constructor for OpenMMRunner.
 
@@ -205,6 +206,13 @@ class OpenMMRunner(Runner):
         self.enforce_box = enforce_box
 
         self.getState_kwargs = dict(GET_STATE_KWARG_DEFAULTS)
+        # Optionally override which state fields are pulled off the GPU each
+        # segment. By default GET_STATE_KWARG_DEFAULTS fetches everything
+        # (positions, velocities, forces, energy, parameters, derivatives); a
+        # caller that only saves positions/box can pass a trimmed dict here to
+        # cut GPU->CPU transfer per segment.
+        if getState_kwargs is not None:
+            self.getState_kwargs.update(getState_kwargs)
         # update with the user based enforce_box
         self.getState_kwargs['enforcePeriodicBox'] = self.enforce_box
 
