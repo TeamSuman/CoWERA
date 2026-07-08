@@ -54,6 +54,8 @@ class CoWERAResampler(CloneMergeResampler):
                  mode = "greedy",
                  use_cv_history = True,
                  history_window = None,
+                 bin_increase_factor = 1.2,
+                 bin_decrease_factor = 0.8,
                  **kwargs):
 
         """Constructor for the REVO Resampler.
@@ -139,6 +141,11 @@ class CoWERAResampler(CloneMergeResampler):
         self.use_cv_history = use_cv_history
         self.history_window = history_window
         self._cv_history = None
+
+        # Adaptive-bin adjustment factors (paper Appendix F). Kept as attributes
+        # so they can be set from config; forwarded to both analysis paths.
+        self.bin_increase_factor = bin_increase_factor
+        self.bin_decrease_factor = bin_decrease_factor
 
         # Most recent adaptive bin count returned by ``resample``. Snapshotted by
         # the pickle/checkpoint reporter so a restarted run resumes with the same
@@ -392,12 +399,16 @@ class CoWERAResampler(CloneMergeResampler):
             projections = self._cv_history.as_list()
             dl, n_bins = self.distance.intensity_from_projections(
                 projections, dranges, n_d=n_d, it=it,
-                n_bins=n_bins, max_bins=max_bins)
+                n_bins=n_bins, max_bins=max_bins,
+                bin_increase_factor=self.bin_increase_factor,
+                bin_decrease_factor=self.bin_decrease_factor)
         else:
             # Legacy path: re-read and re-project each walker's full DCD.
             dl, n_bins = self.distance.intensity_calculation(
                 n_walkers=len(walkers), path=folder, n_d=n_d, it=it,
-                n_bins=n_bins, max_bins=max_bins)
+                n_bins=n_bins, max_bins=max_bins,
+                bin_increase_factor=self.bin_increase_factor,
+                bin_decrease_factor=self.bin_decrease_factor)
 
         return dl, [row for row in dist_mat], images, n_bins
 

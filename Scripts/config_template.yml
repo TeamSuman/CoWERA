@@ -242,8 +242,15 @@ use_cv_history: true
 
 # Optional cap on the retained per-walker CV history length (number of
 # saved frames). Bounds the changepoint-detection cost for very long
-# walkers. Leave as null for unbounded (full) history.
+# walkers. Leave as null for unbounded (full) history (paper-faithful).
 history_window: null
+
+# Adaptive-bin adjustment factors (paper Appendix F). When <20% of bins are
+# visited, n_bins *= bin_increase_factor; when >80%, n_bins *= bin_decrease_factor.
+# Defaults 1.2 / 0.8 match the code's historical behaviour. NOTE: the manuscript
+# text states 1.5 / 0.75 -- set these to reproduce the paper exactly (decision D-1).
+bin_increase_factor: 1.2
+bin_decrease_factor: 0.8
 
 
 

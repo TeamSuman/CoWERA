@@ -511,6 +511,11 @@ if __name__ == "__main__":
     # defaults keep existing config files working unchanged).
     use_cv_history = getattr(args, "use_cv_history", True)
     history_window = getattr(args, "history_window", None)
+    # Adaptive-bin adjustment factors (paper Appendix F). Defaults preserve the
+    # existing code behaviour (1.2 / 0.8). NOTE (decision D-1): the manuscript
+    # states 1.5 / 0.75 -- set these explicitly to reproduce the paper text.
+    bin_increase_factor = getattr(args, "bin_increase_factor", 1.2)
+    bin_decrease_factor = getattr(args, "bin_decrease_factor", 0.8)
 
     # Set up the Resampler with the parameters
     resampler = CoWERAResampler(distance=proj_distance,
@@ -525,7 +530,9 @@ if __name__ == "__main__":
                               mode=mode,
                               seed=seed,
                               use_cv_history=use_cv_history,
-                              history_window=history_window)
+                              history_window=history_window,
+                              bin_increase_factor=bin_increase_factor,
+                              bin_decrease_factor=bin_decrease_factor)
 
     # Set up the boundary conditions for a non-eq ensemble
     tbc = TargetBC(cutoff_distance=d_warped,

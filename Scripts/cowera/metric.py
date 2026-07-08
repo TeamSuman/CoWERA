@@ -1,8 +1,10 @@
+import logging
 import os
 
 import numpy as np
 from joblib import Parallel, delayed
 
+import cowera.features as _features
 from cowera.features import best_hummer_q, RMSD_Backbone
 
 
@@ -272,21 +274,62 @@ class Calculate_Distances:
             raise ValueError(f"Unrecognized feature selection: {self._feat}")
         return projection, drange
 
+    def _load_walker_traj(self, i, path):
+        """Load walker ``i``'s DCD as an mdtraj Trajectory, with the same
+        init-structure fallback (and fallback counter) as the feature functions.
+        """
+        import mdtraj as md
+
+        traj_file = f"{path}walker_{i}.dcd"
+        top = self.native_file if self._feat == "best_hummer_q" else self.top_file
+        try:
+            return md.load(traj_file, top=top)
+        except Exception as exc:
+            if self.init_file is None:
+                raise
+            _features._FALLBACK_COUNT += 1
+            logging.warning(
+                "Could not load %r (%s); falling back to init_file "
+                "(the initial-structure CV is substituted for this walker).",
+                traj_file, exc)
+            return md.load(self.init_file, top=top)
+
+    def _project_traj(self, traj_obj):
+        """Project an already-loaded mdtraj Trajectory onto the progress coordinate.
+
+        No init-structure fallback here (the trajectory is already in hand); a
+        failure is a genuine error. Returns ``(projection, drange)``.
+        """
+        if self._feat == "best_hummer_q":
+            return best_hummer_q(traj=traj_obj, native_file=self.native_file, init_file=None)
+        elif self._feat == "rmsd_backbone":
+            unfolded = self.tar_file if self.increment == 1 else self.init_file
+            return RMSD_Backbone(traj=traj_obj, init_file=None,
+                                 unfolded_file=unfolded, top_file=self.top_file)
+        raise ValueError(f"Unrecognized feature selection: {self._feat}")
+
     def project_new_frames(self, i, path, offset):
         """Project only the frames produced since ``offset`` for walker ``i``.
 
-        Returns ``(new_projection, drange, total_frames, was_reset)``. A reset
-        (the trajectory now has fewer frames than were previously consumed, e.g.
-        after a warp recreated the file) is reported so the caller can clear the
-        stale in-memory history. This is the seam that Phase 3 will replace with
-        CV values produced inline by the runner, removing the disk read entirely.
+        Returns ``(new_projection, drange, total_frames, was_reset)``. Only the
+        frames beyond ``offset`` are projected: the per-frame CV (Q / backbone
+        RMSD to a fixed reference) is frame-independent, so projecting the slice
+        is numerically identical to projecting the whole trajectory and slicing,
+        at O(new frames) projection cost instead of O(total) every cycle (the
+        latter defeated the in-memory-history design; see Phase 2 in the docs).
+
+        A reset (the trajectory now has fewer frames than were previously
+        consumed, e.g. after a warp recreated the file) is reported so the caller
+        can clear the stale in-memory history. (The DCD is still read in full;
+        eliminating that read is a further, runner-side optimization.)
         """
         from cowera.cv_history import incremental_window
 
-        full, drange = self._load_projection(i, path)
-        n_frames = len(full)
+        traj_obj = self._load_walker_traj(i, path)
+        n_frames = traj_obj.n_frames
         was_reset, start, total = incremental_window(offset, n_frames)
-        return np.asarray(full[start:]), drange, total, was_reset
+        proj, drange = self._project_traj(traj_obj[start:])
+        return np.asarray(proj), drange, total, was_reset
 
     def phase_from_projection(self, projection, drange, n_d, n_bins=100):
         """Compute ``(bins, phase, weight)`` from an in-memory CV series.
@@ -362,12 +405,18 @@ class Calculate_Distances:
         return intensity, n_bins
 
     def intensity_from_projections(self, projections, dranges, n_d, it,
-                                   n_bins=100, max_bins=125, n_jobs=-1):
+                                   n_bins=100, max_bins=125,
+                                   bin_increase_factor=1.2, bin_decrease_factor=0.8,
+                                   n_jobs=-1):
         """Compute intensities directly from in-memory CV histories.
 
         This is the disk-free analysis path used by the resampler: it consumes
         the accumulated per-walker projection arrays maintained by
         :class:`cowera.cv_history.CVHistory` instead of re-reading DCD files.
+
+        ``bin_increase_factor`` / ``bin_decrease_factor`` are the adaptive-bin
+        adjustment factors (paper Appendix F); previously this method silently
+        dropped them, always using the ``intensity_from_phases`` defaults.
         """
         n_walkers = len(projections)
         results = Parallel(n_jobs=_resolve_n_jobs(n_jobs), prefer="threads")(
@@ -378,7 +427,8 @@ class Calculate_Distances:
         phase_arr = [r[1] for r in results]
         weight_arr = [r[2] for r in results]
         return self.intensity_from_phases(bins_list, phase_arr, weight_arr,
-                                           n_walkers, it, n_bins, max_bins)
+                                           n_walkers, it, n_bins, max_bins,
+                                           bin_increase_factor, bin_decrease_factor)
 
     def intensity_calculation(self, n_walkers, path, n_d, it,
                               n_bins=100, max_bins=125,
