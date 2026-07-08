@@ -155,6 +155,13 @@ platform_kwargs: null
 # Ignored for GPU platforms, where the number of workers is len(gpu_ids).
 n_workers: 4
 
+# EXPERIMENTAL (GPU only, default false): use persistent per-GPU workers that
+# cache the OpenMM Context, instead of forking a process + rebuilding the Context
+# for every walker every cycle (which recompiles kernels + re-uploads the system).
+# Large multi-GPU speedup for short resampling intervals. Validate on your GPU
+# host before production use; the default (false) keeps the process-per-task path.
+persistent_workers: false
+
 
 # ===============================================================
 # 🎮 GPU CONFIGURATION

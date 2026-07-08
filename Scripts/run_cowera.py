@@ -23,9 +23,10 @@ import warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-from wepy.runners.openmm import OpenMMGPUWalkerTaskProcess, OpenMMCPUWalkerTaskProcess, OpenMMRunner, OpenMMWalker, OpenMMState, gen_sim_state
+from wepy.runners.openmm import OpenMMGPUWalkerTaskProcess, OpenMMCPUWalkerTaskProcess, OpenMMGPUWorker, OpenMMRunner, OpenMMWalker, OpenMMState, gen_sim_state
 from wepy.reporter.hdf5 import WepyHDF5Reporter
 from wepy.work_mapper.task_mapper import TaskMapper
+from wepy.work_mapper.mapper import WorkerMapper
 from wepy.util.mdtraj import mdtraj_to_json_topology
 
 from walker_pkl_reporter import WalkersPickleReporter, latest_checkpoint
@@ -143,6 +144,10 @@ _DEFAULT_GETSTATE = {'getPositions': True, 'getVelocities': True,
 getstate_kwargs = getattr(args, "getstate_kwargs", None) or _DEFAULT_GETSTATE
 platform_name  = getattr(args, "platform", "CUDA")
 platform_kwargs = getattr(args, "platform_kwargs", None)
+# EXPERIMENTAL (default off): persistent per-GPU workers with a cached OpenMM
+# Context, instead of forking a process + rebuilding the Context every walker
+# every cycle. Big multi-GPU speedup, but must be validated on a GPU host.
+persistent_workers = getattr(args, "persistent_workers", False)
 _GPU_PLATFORMS = ("CUDA", "OpenCL")
 is_gpu_platform = platform_name in _GPU_PLATFORMS
 # Number of concurrent walker worker processes. For GPU platforms this is the
@@ -377,10 +382,14 @@ if __name__ == "__main__":
     # deterministic_dynamics is requested) makes the per-segment integrator seed a
     # deterministic function of (seed, cycle, walker) instead of OpenMM's default 0
     # (which re-randomizes each segment).
+    # Context reuse only helps with a persistent mapper (WorkerMapper); with the
+    # default process-per-task mapper each process dies after one segment.
+    use_persistent = persistent_workers and is_gpu_platform
     runner = OpenMMRunner(system, top.topology, integrator, platform=platform_name,
                           platform_kwargs=platform_kwargs, dcd_folder=dcd_folder, save_freq=save_freq,
                           random_seed=(seed if deterministic_dynamics else None),
-                          getState_kwargs=getstate_kwargs)
+                          getState_kwargs=getstate_kwargs,
+                          reuse_context=use_persistent)
 
     # Select the feature
     sel_feat = sel_feat
@@ -592,10 +601,20 @@ if __name__ == "__main__":
             raise ValueError(
                 f"platform '{platform_name}' requires a non-empty 'gpu_ids' list in the config."
             )
-        mapper = TaskMapper(walker_task_type=OpenMMGPUWalkerTaskProcess,
-                            num_workers=num_workers,
-                            platform=platform_name,
-                            device_ids=gpu_ids)
+        if use_persistent:
+            # Persistent long-lived worker per device slot; the runner caches its
+            # OpenMM Context so each segment is just setState -> step -> getState.
+            print(f"{Fore.YELLOW}{Style.BRIGHT}>>> Using persistent per-GPU workers "
+                  f"(cached Context) [EXPERIMENTAL]")
+            mapper = WorkerMapper(worker_type=OpenMMGPUWorker,
+                                  num_workers=num_workers,
+                                  platform=platform_name,
+                                  device_ids=gpu_ids)
+        else:
+            mapper = TaskMapper(walker_task_type=OpenMMGPUWalkerTaskProcess,
+                                num_workers=num_workers,
+                                platform=platform_name,
+                                device_ids=gpu_ids)
     else:
         mapper = TaskMapper(walker_task_type=OpenMMCPUWalkerTaskProcess,
                             num_workers=num_workers,
