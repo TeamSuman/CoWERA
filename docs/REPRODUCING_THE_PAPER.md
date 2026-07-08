@@ -160,6 +160,37 @@ estimates with confidence intervals across replicas.
 On a multi-GPU workstation, list every device in `gpu_ids` (e.g. `[0, 1, 2, 3]`);
 walkers are distributed across the listed GPUs.
 
+### 3.1 Running on HPC clusters (SLURM / PBS)
+
+Ready-to-edit batch scripts are provided:
+
+```bash
+# SLURM — one run, or 5 replicas as a job array (distinct run id per task):
+sbatch --export=ALL,CONFIG=./Systems/chignolin/config.yml Scripts/slurm/cowera.sbatch
+sbatch --array=0-4 --export=ALL,CONFIG=./Systems/chignolin/config.yml Scripts/slurm/cowera.sbatch
+
+# PBS:
+qsub -v CONFIG=./Systems/chignolin/config.yml,REPO_ROOT=$PWD Scripts/sample_job_multirun.sh
+```
+
+Both scripts activate the `cowera` env, run from the repository root, start **and
+tear down** CUDA MPS, and keep BLAS/OpenMP threads inside the allocation. Notes:
+
+- **Device ids.** `gpu_ids` must index the **scheduler-visible** devices — SLURM/PBS
+  renumber `CUDA_VISIBLE_DEVICES` to `0..N-1`, so use those, not physical ids.
+  Repeat ids (`[0,0,0]`) only to pack walkers on one GPU via MPS.
+- **CPU-only nodes.** Set `platform: "CPU"`, `gpu_ids: []`, and `n_workers: <cores>`.
+- **Wall-time / restart.** Set a realistic `--time`; if a job is cut off, resume with
+  the same config plus `--restart` (or `restart: true`) — it continues from the newest
+  checkpoint (written every `checkpoint_freq` cycles) without clobbering prior output.
+- **Shared filesystems (Lustre/GPFS).** CoWERA writes many small per-walker DCD files
+  and appends to them every cycle, which stresses the metadata server. Set
+  `scratch_dir: "$TMPDIR"` in the config to stage that trajectory I/O on node-local
+  disk; it is synced back to the output directory on exit. Checkpoints and the
+  results file stay on the (durable) output directory so restart still works.
+- **CPU oversubscription.** The per-cycle analysis honors `SLURM_CPUS_PER_TASK` /
+  `PBS_NP` for its joblib pool, so keep `--cpus-per-task` accurate.
+
 ---
 
 ## 4. Analysis (Tables II–III, Figs. 3–5)
