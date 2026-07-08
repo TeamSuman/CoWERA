@@ -16,7 +16,12 @@ import simtk.unit as unit
 import mdtraj as mdj
 
 import warnings
-warnings.filterwarnings("ignore")
+# Silence only the noisy third-party deprecation/future chatter, NOT UserWarnings.
+# CoWERA's feature functions surface trajectory-read fallbacks (which substitute the
+# initial structure's CV and can bias resampling) via logging.warning -> dashboard.log;
+# a blanket filterwarnings("ignore") previously hid those entirely.
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 from wepy.runners.openmm import OpenMMGPUWalkerTaskProcess, OpenMMCPUWalkerTaskProcess, OpenMMRunner, OpenMMWalker, OpenMMState, gen_sim_state
 from wepy.reporter.hdf5 import WepyHDF5Reporter
@@ -78,14 +83,18 @@ def get_args():
     return args
 
 
-# Optional: colored terminal output
+# Optional: colored terminal output. Never install packages at runtime (compute
+# nodes are often offline / read-only); fall back to a no-op color shim instead.
 try:
     from colorama import Fore, Style, init
     init(autoreset=True)
 except ImportError:
-    os.system("pip install colorama")
-    from colorama import Fore, Style, init
-    init(autoreset=True)
+    class _NoColor:
+        def __getattr__(self, _name):
+            return ""
+    Fore = Style = _NoColor()
+    def init(*args, **kwargs):
+        pass
 
 # -------------------- Parse args -------------------- #
 args = get_args()
@@ -122,6 +131,8 @@ distance_criterion = args.distance_criterion
 restart        = args.restart
 checkpoint_freq = getattr(args, "checkpoint_freq", 10)
 scratch_dir    = getattr(args, "scratch_dir", None)
+seed           = getattr(args, "seed", None)
+deterministic_dynamics = getattr(args, "deterministic_dynamics", False)
 platform_name  = getattr(args, "platform", "CUDA")
 platform_kwargs = getattr(args, "platform_kwargs", None)
 _GPU_PLATFORMS = ("CUDA", "OpenCL")
@@ -354,9 +365,13 @@ if __name__ == "__main__":
     new_simtk_state = gen_sim_state(pos, system, integrator)
     #target_state = gen_sim_state(tar_pos, system, integrator)
 
-    # set up the OpenMMRunner with your system
+    # set up the OpenMMRunner with your system. random_seed (only when
+    # deterministic_dynamics is requested) makes the per-segment integrator seed a
+    # deterministic function of (seed, cycle, walker) instead of OpenMM's default 0
+    # (which re-randomizes each segment).
     runner = OpenMMRunner(system, top.topology, integrator, platform=platform_name,
-                          platform_kwargs=platform_kwargs, dcd_folder=dcd_folder, save_freq=save_freq)
+                          platform_kwargs=platform_kwargs, dcd_folder=dcd_folder, save_freq=save_freq,
+                          random_seed=(seed if deterministic_dynamics else None))
 
     # Select the feature
     sel_feat = sel_feat
@@ -499,6 +514,7 @@ if __name__ == "__main__":
                               dcd_folder=dcd_folder,
                               pmax=pmax,
                               mode=mode,
+                              seed=seed,
                               use_cv_history=use_cv_history,
                               history_window=history_window)
 

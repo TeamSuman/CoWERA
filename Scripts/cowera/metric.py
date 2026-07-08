@@ -1,7 +1,27 @@
+import os
+
 import numpy as np
 from joblib import Parallel, delayed
 
 from cowera.features import best_hummer_q, RMSD_Backbone
+
+
+def _resolve_n_jobs(n_jobs):
+    """Choose a joblib worker count that respects the scheduler CPU allocation.
+
+    ``joblib``'s ``n_jobs=-1`` grabs every logical core, oversubscribing a
+    SLURM/PBS cgroup allocation and contending with the per-walker MD processes.
+    When ``n_jobs`` is left at the auto default (None or -1) we instead honor
+    ``SLURM_CPUS_PER_TASK`` / ``PBS_NP`` if present, falling back to -1 only
+    outside a scheduler.
+    """
+    if n_jobs is not None and n_jobs != -1:
+        return n_jobs
+    for var in ("SLURM_CPUS_PER_TASK", "PBS_NP", "OMP_NUM_THREADS"):
+        val = os.environ.get(var)
+        if val and val.isdigit() and int(val) > 0:
+            return int(val)
+    return -1
 
 # Heavy / optional dependencies are imported lazily inside the methods that use
 # them (ruptures for changepoint detection, MDAnalysis for the pairwise RMSD
@@ -350,7 +370,7 @@ class Calculate_Distances:
         :class:`cowera.cv_history.CVHistory` instead of re-reading DCD files.
         """
         n_walkers = len(projections)
-        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        results = Parallel(n_jobs=_resolve_n_jobs(n_jobs), prefer="threads")(
             delayed(self.phase_from_projection)(projections[i], dranges[i], n_d, n_bins)
             for i in range(n_walkers)
         )
@@ -365,7 +385,7 @@ class Calculate_Distances:
                               bin_increase_factor=1.2, bin_decrease_factor=0.8,
                               n_jobs=-1):
         """Disk-based compatibility wrapper (kept for the legacy code path)."""
-        results = Parallel(n_jobs=n_jobs, prefer="threads")(
+        results = Parallel(n_jobs=_resolve_n_jobs(n_jobs), prefer="threads")(
             delayed(self.phase_calculation)(i, path, n_d, n_bins)
             for i in range(n_walkers)
         )

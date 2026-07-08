@@ -124,6 +124,7 @@ class OpenMMRunner(Runner):
                  platform_kwargs=None,
                  dcd_folder=None,
                  save_freq=1,
+                 random_seed=None,
                  enforce_box=False):
         """Constructor for OpenMMRunner.
 
@@ -190,6 +191,11 @@ class OpenMMRunner(Runner):
         self.integrator = integrator
         self.dcd_folder = dcd_folder
         self.save_freq = save_freq
+        # Optional base seed for deterministic per-segment integrator seeding. When
+        # None (default) the integrator seed is left at OpenMM's 0 (re-randomized
+        # each segment). Note: GPU MD is not bitwise reproducible even with a fixed
+        # seed, so this yields controlled-but-not-identical dynamics.
+        self.random_seed = random_seed
 
         # these are not SWIG objects
         self.topology = topology
@@ -370,10 +376,19 @@ class OpenMMRunner(Runner):
 
         # make a copy of the integrator for this particular segment
         new_integrator = copy(self.integrator)
-        # force setting of random seed to 0, which is a special
-        # value that forces the integrator to choose another
-        # random number
-        new_integrator.setRandomNumberSeed(0)
+        # By default seed 0 -- a special value that makes OpenMM choose a fresh
+        # random seed each segment. If a base random_seed was configured
+        # (deterministic_dynamics), derive a reproducible per-segment seed from
+        # (base, cycle, walker) instead so runs are controllable.
+        if self.random_seed is None:
+            new_integrator.setRandomNumberSeed(0)
+        else:
+            cycle_idx = kwargs.get('cycle_idx', 0) or 0
+            widx = walker_idx if walker_idx is not None else 0
+            derived = (int(self.random_seed) * 2654435761
+                       + int(cycle_idx) * 131071
+                       + int(widx)) % (2**31 - 1)
+            new_integrator.setRandomNumberSeed(derived if derived != 0 else 1)
 
         ## Platform
 

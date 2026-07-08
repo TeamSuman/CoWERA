@@ -8,6 +8,7 @@ from wepy.resampling.resamplers.resampler import Resampler
 from wepy.resampling.resamplers.clone_merge  import CloneMergeResampler
 from wepy.resampling.decisions.clone_merge import MultiCloneMergeDecision
 from cowera.file_resampler import update_dcd_files
+from cowera.features import get_fallback_count
 
 class CoWERAResampler(CloneMergeResampler):
     r"""
@@ -143,6 +144,10 @@ class CoWERAResampler(CloneMergeResampler):
         # the pickle/checkpoint reporter so a restarted run resumes with the same
         # bin resolution instead of jumping back to the config's initial value.
         self._last_n_bins = None
+
+        # Running total of feature-read fallbacks at the previous cycle, so we can
+        # report the per-cycle delta (a nonzero value flags CV corruption risk).
+        self._prev_fallback_count = 0
 
         # we do not know the shape and dtype of the images until
         # runtime so we determine them here
@@ -441,8 +446,14 @@ class CoWERAResampler(CloneMergeResampler):
         resampling_data, variation, happen = self.decide(walker_weights, num_walker_copies, distance_arr, distance_matrix,images)
 
 
+        # Per-cycle count of feature-read fallbacks (init-structure CV substituted
+        # for a walker). Nonzero flags possible CV/intensity corruption this cycle.
+        total_fallbacks = get_fallback_count()
+        cv_fallbacks = total_fallbacks - self._prev_fallback_count
+        self._prev_fallback_count = total_fallbacks
+
         file = open(f'{self.info_file_path}', 'a')
-        file.write(f'Cycle: {cycle_id}'+'\t'+f'Clst walk. proj: {cw_dist}'+'\t'+f'Resampling happend: {happen}'+'\t'+f'n_bins: {n_bins}'+'\n')
+        file.write(f'Cycle: {cycle_id}'+'\t'+f'Clst walk. proj: {cw_dist}'+'\t'+f'Resampling happend: {happen}'+'\t'+f'n_bins: {n_bins}'+'\t'+f'CV_fallbacks: {cv_fallbacks}'+'\n')
         file.close()
 
         # convert the target idxs and decision_id to feature vector arrays

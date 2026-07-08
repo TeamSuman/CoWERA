@@ -218,6 +218,16 @@ increment: -1
 # ⚙️  RESAMPLING PERFORMANCE (optional; Phase 2)
 # ===============================================================
 
+# Random seed for the resampler's clone/merge decisions. null => nondeterministic.
+# Set an integer to make resampling decisions reproducible run-to-run.
+seed: null
+
+# When true, derive each MD segment's integrator seed deterministically from
+# (seed, cycle, walker) instead of OpenMM's default 0 (which re-randomizes each
+# segment). NOTE: GPU MD is not bitwise reproducible even so; this gives
+# controlled-but-not-identical dynamics. Default false (preserves prior behaviour).
+deterministic_dynamics: false
+
 # Use the in-memory CV history for the coherence analysis instead of
 # re-reading and re-projecting each walker's full DCD trajectory every
 # cycle. Default: true. Set to false to use the legacy disk-based path.
