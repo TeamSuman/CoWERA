@@ -139,6 +139,11 @@ class CoWERAResampler(CloneMergeResampler):
         self.history_window = history_window
         self._cv_history = None
 
+        # Most recent adaptive bin count returned by ``resample``. Snapshotted by
+        # the pickle/checkpoint reporter so a restarted run resumes with the same
+        # bin resolution instead of jumping back to the config's initial value.
+        self._last_n_bins = None
+
         # we do not know the shape and dtype of the images until
         # runtime so we determine them here
         #print("init state",init_state)
@@ -465,5 +470,8 @@ class CoWERAResampler(CloneMergeResampler):
                            'variation' : np.array([variation]),
                            'images' : np.ravel(np.array(images)),
                            'image_shape' : np.array(images[0].shape)}]
+
+        # record the adaptive bin count for checkpointing/restart
+        self._last_n_bins = n_bins
 
         return resampled_walkers, resampling_data, resampler_data, n_bins

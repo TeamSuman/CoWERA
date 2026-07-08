@@ -186,6 +186,22 @@ n_bins: 122
 max_bins: 122
 
 
+# ===============================================================
+# 💾 CHECKPOINT / RESTART
+# ===============================================================
+
+# Write a checkpoint (walker states + cycle index + adaptive bin count) every
+# this many cycles. Enables `--restart`. Larger values reduce I/O; smaller
+# values lose less work if a job is killed. Default: 10.
+checkpoint_freq: 10
+
+# Resume from the newest checkpoint in the output directory instead of starting
+# fresh. Equivalent to passing --restart on the command line. On restart the
+# output directory, trajectories and results file are preserved (never clobbered)
+# and the per-walker CV histories rebuild from the saved walker_*.dcd files.
+restart: false
+
+
 
 # ===============================================================
 # 🔁 FOLDING / UNFOLDING MODE

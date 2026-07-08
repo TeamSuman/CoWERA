@@ -4,6 +4,7 @@ import os, sys
 import os.path as osp
 import shutil
 import time
+import pickle
 
 sys.path.append(os.path.abspath("Scripts/"))
 sys.path.append(os.path.abspath("Systems/"))
@@ -22,7 +23,7 @@ from wepy.reporter.hdf5 import WepyHDF5Reporter
 from wepy.work_mapper.task_mapper import TaskMapper
 from wepy.util.mdtraj import mdtraj_to_json_topology
 
-from walker_pkl_reporter import WalkersPickleReporter
+from walker_pkl_reporter import WalkersPickleReporter, latest_checkpoint
 
 from wepy.reporter.dashboard import DashboardReporter
 from wepy.reporter.openmm import OpenMMRunnerDashboardSection
@@ -47,6 +48,9 @@ import importlib.util
 def get_args():
     parser = argparse.ArgumentParser(description="Run CoWERA simulation.")
     parser.add_argument("--config", type=str, help="Path to YAML input file.")
+    parser.add_argument("--restart", action="store_true",
+                        help="Resume from the newest checkpoint in the output "
+                             "directory instead of starting a fresh run.")
     args_cli = parser.parse_args()
 
     if args_cli.config:
@@ -58,6 +62,9 @@ def get_args():
         args = argparse.Namespace(**cfg)
     else:
         raise ValueError("Please provide a configuration file using --config")
+
+    # Restart may be requested on the CLI or in the config file.
+    args.restart = bool(args_cli.restart or getattr(args, "restart", False))
 
     # ``gpu_ids`` is optional for CPU/Reference execution; default to an empty
     # list so len()/derived parameters stay well-defined.
@@ -112,6 +119,8 @@ distance_criterion = args.distance_criterion
 
 # Compute platform selection (default CUDA preserves prior behaviour). Non-CUDA
 # platforms (CPU/Reference/OpenCL) let CoWERA run on CPU-only HPC nodes.
+restart        = args.restart
+checkpoint_freq = getattr(args, "checkpoint_freq", 10)
 platform_name  = getattr(args, "platform", "CUDA")
 platform_kwargs = getattr(args, "platform_kwargs", None)
 _GPU_PLATFORMS = ("CUDA", "OpenCL")
@@ -210,24 +219,32 @@ if __name__ == "__main__":
 
     outputs_dir = f'{inp_path}/{output_folder}/simdata_run{run}_steps{n_steps}_cycs{n_cycles}'
 
-    # If the folder exists, rename it with a timestamp
-    if os.path.exists(outputs_dir):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_name = f"{outputs_dir}_backup_{timestamp}"
-        shutil.move(outputs_dir, backup_name)
-        os.makedirs(outputs_dir)
+    if restart:
+        # Resume: reuse the existing output directory in place. Never move it
+        # aside or clear it, so trajectories, results and checkpoints survive.
+        if not os.path.exists(outputs_dir):
+            raise FileNotFoundError(
+                f"--restart given but no existing output directory to resume: {outputs_dir}"
+            )
+        print(f"{Fore.YELLOW}{Style.BRIGHT}>>> RESTART: resuming run in {outputs_dir}")
     else:
+        # Fresh run: if the folder exists, rename it with a timestamp backup.
+        if os.path.exists(outputs_dir):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_name = f"{outputs_dir}_backup_{timestamp}"
+            shutil.move(outputs_dir, backup_name)
         os.makedirs(outputs_dir)
-    #os.makedirs(outputs_dir, exist_ok=True)
 
     info_file_path = f'{outputs_dir}/Info_{run}.txt'
 
-    # If the file exists, delete it
-    if os.path.exists(info_file_path):
-        os.remove(info_file_path)
-
-    # Create a new empty file
-    open(info_file_path, 'w').close()
+    # On a fresh run start with an empty Info file; on restart append to the
+    # existing one so the per-cycle log stays contiguous across the checkpoint.
+    if not restart:
+        if os.path.exists(info_file_path):
+            os.remove(info_file_path)
+        open(info_file_path, 'w').close()
+    elif not os.path.exists(info_file_path):
+        open(info_file_path, 'w').close()
 
     #select folder for dcd files
     dcd_folder = f'{outputs_dir}/trajectories/'
@@ -380,8 +397,34 @@ if __name__ == "__main__":
     walker_state = OpenMMState(new_simtk_state)
     #target_walker_state = OpenMMState(target_state)
 
-    # Make a list of the initial walkers
-    init_walkers = [OpenMMWalker(walker_state, init_weight) for i in range(num_walkers)]
+    # --------------------- Restart bookkeeping --------------------- #
+    # Defaults for a fresh run; overwritten below when resuming.
+    start_cycle = 0
+    continue_run = None
+    restored_n_bins = None
+    pkl_dir = osp.join(outputs_dir, 'pkls')
+
+    if restart:
+        ckpt = latest_checkpoint(pkl_dir)
+        if ckpt is None:
+            raise FileNotFoundError(
+                f"--restart given but no complete checkpoint found in {pkl_dir}"
+            )
+        walkers_path, meta_path, ckpt_cycle = ckpt
+        with open(walkers_path, 'rb') as f:
+            init_walkers = pickle.load(f)
+        with open(meta_path, 'rb') as f:
+            meta = pickle.load(f)
+        start_cycle = ckpt_cycle + 1
+        restored_n_bins = meta.get('n_bins')
+        print(f"{Fore.YELLOW}{Style.BRIGHT}>>> Resuming from cycle {ckpt_cycle} "
+              f"(next cycle {start_cycle}), n_bins={restored_n_bins}")
+        if start_cycle >= n_cycles:
+            print(f"{Fore.GREEN}{Style.BRIGHT}Checkpoint already at/after n_cycles; nothing to do.")
+            sys.exit(0)
+    else:
+        # Make a list of the initial walkers
+        init_walkers = [OpenMMWalker(walker_state, init_weight) for i in range(num_walkers)]
 
 
     # Distance metric to be used in resampling
@@ -439,20 +482,37 @@ if __name__ == "__main__":
                     top_file=native_path
                     )
 
-    #output_dir = '/home/suman/Shaheerah/WeTICA/Systems/TC10b Trp-cage/simdata_run0_steps10000_cycs20000'
-    #os.makedirs(output_dir, exist_ok=True)
-    # Set up the HDF5 reporter
+    # Set up the HDF5 reporter. A fresh run creates the file (mode 'x'); a
+    # restart opens the existing file (mode 'r+') and links a new run as a
+    # continuation of the last one (continue_run) so analysis can follow it.
+    h5_path = osp.join(outputs_dir, 'wepy.results.h5')
+    hdf5_mode = 'x'
+    if restart:
+        hdf5_mode = 'r+'
+        try:
+            from wepy.hdf5 import WepyHDF5
+            with WepyHDF5(h5_path, mode='r') as _probe:
+                run_idxs = list(_probe.run_idxs)
+            continue_run = max(run_idxs) if run_idxs else None
+        except Exception as exc:
+            logging.warning(f"Could not read existing runs from {h5_path} ({exc}); "
+                            "continuing as an unlinked run.")
+            continue_run = None
+
     hdf5_reporter = WepyHDF5Reporter(save_fields=('positions','box_vectors'),
-                                file_path=osp.join(outputs_dir,f'wepy.results.h5') ,
+                                file_path=h5_path,
+                                mode=hdf5_mode,
                                 resampler=resampler,
                                 boundary_conditions=tbc,
                                 topology=json_top)
 
-    # Set up the pickle reporter (Essential for restarts)
-    out_folder_pkl = osp.join(outputs_dir,f'pkls')
+    # Set up the pickle/checkpoint reporter (enables --restart). Keep existing
+    # checkpoints on restart so the one that seeded this run is not wiped.
+    out_folder_pkl = pkl_dir
     pkl_reporter = WalkersPickleReporter(save_dir = out_folder_pkl,
-                                      freq = 1,
-                                      num_backups = 2)
+                                      freq = checkpoint_freq,
+                                      num_backups = 2,
+                                      wipe_on_init = not restart)
 
     # Set up the dashboard reporter
     dashboard_path = osp.join(outputs_dir,f'wepy.dash.org')
@@ -478,14 +538,16 @@ if __name__ == "__main__":
                             platform=platform_name)
 
 
-    # Build the simulation manager
+    # Build the simulation manager. On restart resume the adaptive bin count
+    # snapshotted in the checkpoint so the bin resolution stays continuous.
+    active_n_bins = restored_n_bins if (restart and restored_n_bins is not None) else n_bins
     sim_manager = Manager(init_walkers,
                           runner=runner,
                           resampler=resampler,
                           boundary_conditions=tbc,
                           work_mapper=mapper,
                           reporters=[hdf5_reporter, pkl_reporter, dashboard_reporter],
-                          n_bins=n_bins,
+                          n_bins=active_n_bins,
                           max_bins = max_bins,
                           outputs_dir=outputs_dir
                           )
@@ -503,9 +565,11 @@ if __name__ == "__main__":
     steps_list = [n_steps for i in range(n_cycles)]
 
 
-    # and..... go!
+    # and..... go!  (start_cycle/continue_run are non-trivial only on restart)
     sim_manager.run_simulation(n_cycles,
-                                steps_list)
+                                steps_list,
+                                start_cycle=start_cycle,
+                                continue_run=continue_run)
 
     print(f"{Fore.GREEN}{Style.BRIGHT}\n✅ Simulation complete! Results saved in:\n{Fore.WHITE}{outputs_dir}\n")
     print(f"{Fore.CYAN}{'=' * 62}{Style.RESET_ALL}")
