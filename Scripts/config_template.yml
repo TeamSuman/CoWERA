@@ -177,6 +177,22 @@ increment: -1
 
 
 # ===============================================================
+# ⚙️  RESAMPLING PERFORMANCE (optional; Phase 2)
+# ===============================================================
+
+# Use the in-memory CV history for the coherence analysis instead of
+# re-reading and re-projecting each walker's full DCD trajectory every
+# cycle. Default: true. Set to false to use the legacy disk-based path.
+use_cv_history: true
+
+# Optional cap on the retained per-walker CV history length (number of
+# saved frames). Bounds the changepoint-detection cost for very long
+# walkers. Leave as null for unbounded (full) history.
+history_window: null
+
+
+
+# ===============================================================
 # 📁 OUTPUT CONFIGURATION
 # ===============================================================
 

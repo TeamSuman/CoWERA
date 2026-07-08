@@ -386,6 +386,11 @@ if __name__ == "__main__":
 
 
 
+    # Phase 2 in-memory CV history options (optional in config; sensible
+    # defaults keep existing config files working unchanged).
+    use_cv_history = getattr(args, "use_cv_history", True)
+    history_window = getattr(args, "history_window", None)
+
     # Set up the Resampler with the parameters
     resampler = CoWERAResampler(distance=proj_distance,
                               init_state=walker_state,
@@ -396,7 +401,9 @@ if __name__ == "__main__":
                               n_d=n_d,
                               dcd_folder=dcd_folder,
                               pmax=pmax,
-                              mode=mode)
+                              mode=mode,
+                              use_cv_history=use_cv_history,
+                              history_window=history_window)
 
     # Set up the boundary conditions for a non-eq ensemble
     tbc = TargetBC(cutoff_distance=d_warped,

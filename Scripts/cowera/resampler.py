@@ -1,11 +1,9 @@
 import random as rand
-import itertools as iter
 
 import logging
 from eliot import start_action, log_call
 
 import numpy as np
-import random
 from wepy.resampling.resamplers.resampler import Resampler
 from wepy.resampling.resamplers.clone_merge  import CloneMergeResampler
 from wepy.resampling.decisions.clone_merge import MultiCloneMergeDecision
@@ -53,6 +51,8 @@ class CoWERAResampler(CloneMergeResampler):
                  dcd_folder = None,
                  n_d = None,
                  mode = "greedy",
+                 use_cv_history = True,
+                 history_window = None,
                  **kwargs):
 
         """Constructor for the REVO Resampler.
@@ -119,8 +119,25 @@ class CoWERAResampler(CloneMergeResampler):
 
         #dcd folder
         self.dcd_folder = dcd_folder
+
+        # Unified random number generator. Previously three different RNGs
+        # (``random``, ``numpy.random`` and the ``rand`` alias) were used while
+        # only ``rand`` was seeded, which undermined run-to-run reproducibility.
+        # We now drive every stochastic decision from a single seeded Generator.
+        self._rng = np.random.default_rng(seed)
         if seed is not None:
             rand.seed(seed)
+
+        # Phase 2: in-memory CV history. When enabled, each walker's progress
+        # coordinate time series is maintained in memory and updated
+        # incrementally (only newly produced frames are projected each cycle)
+        # instead of re-reading and re-projecting the entire accumulated DCD
+        # every cycle. ``history_window`` optionally bounds the retained history
+        # (and thus the changepoint cost). Set ``use_cv_history=False`` to fall
+        # back to the legacy disk-based analysis path.
+        self.use_cv_history = use_cv_history
+        self.history_window = history_window
+        self._cv_history = None
 
         # we do not know the shape and dtype of the images until
         # runtime so we determine them here
@@ -224,7 +241,7 @@ class CoWERAResampler(CloneMergeResampler):
 
                 eligible = candidates[merge_mask[min_idx, candidates]]
                 if len(eligible) > 0:
-                    closewalk = random.choice(eligible)
+                    closewalk = self._rng.choice(eligible)
 
             #print(f"Max idx: {max_idx}, Max var: {walker_variations[max_idx] if max_idx is not None else 'N/A'}, Min idx: {min_idx}, Min var: {walker_variations[min_idx] if min_idx is not None else 'N/A'}, Close walk: {closewalk}, min dist : {distance_matrix[min_idx, closewalk] if closewalk is not None else 'N/A'}")
             if min_idx is not None and max_idx is not None and closewalk is not None:
@@ -279,8 +296,9 @@ class CoWERAResampler(CloneMergeResampler):
 
 
                 elif self.mode == "probabilistic":
-                    prob = new_variation / (new_variation + variation)
-                    if random.random() < prob:
+                    denom = new_variation + variation
+                    prob = new_variation / denom if denom > 0 else 0.0
+                    if self._rng.random() < prob:
                         variations.append(new_variation)
                         productive = True
                         variation = new_variation
@@ -322,32 +340,56 @@ class CoWERAResampler(CloneMergeResampler):
 
         return walker_actions, variations[-1], happen
 
+    def _update_cv_histories(self, walkers, folder, n_d):
+        """Incrementally update the in-memory per-walker CV histories.
+
+        Only the frames produced since the last cycle are projected and
+        appended; warp resets are detected and clear the stale history. Returns
+        the per-walker progress-coordinate ranges needed for binning.
+        """
+        from cowera.cv_history import CVHistory
+
+        n = len(walkers)
+        if self._cv_history is None or self._cv_history.n_walkers != n:
+            self._cv_history = CVHistory(n, window=self.history_window)
+
+        dranges = [None] * n
+        for i in range(n):
+            new_proj, drange, total, was_reset = self.distance.project_new_frames(
+                i, folder, int(self._cv_history.offsets[i]))
+            if was_reset:
+                self._cv_history.reset(i)
+            self._cv_history.extend(i, new_proj)
+            self._cv_history.offsets[i] = total
+            dranges[i] = drange
+        return dranges
+
     def get_dist(self, walkers, folder, n_d, it, n_bins, max_bins):
 
-        # initialize arrays
-        dl = np.zeros(len(walkers))
-        dist_mat = np.zeros((len(walkers), len(walkers)))
+        # Per-walker projection (image) onto the progress coordinate.
+        images = [self.distance.get_proj_coord(walker.state)[0] for walker in walkers]
 
-        # make images for all the walker states
-        images = []
-        for walker in walkers:
-            image = self.distance.get_proj_coord(walker.state)[0]
-            images.append(image)
-            #print(f"Image for walker: {image}")
-        #print(f"Images for walkers: {images}")
-        # get the combinations of indices for all walker pairs
-        for i, j in iter.combinations(range(len(images)), 2):
+        # Full symmetric pairwise distance matrix, computed in a single
+        # vectorized pass that reuses one cached topology/backbone selection
+        # (previously this constructed two MDAnalysis Universes for *every*
+        # walker pair, every cycle).
+        dist_mat = self.distance.pairwise_distance_matrix(walkers)
 
-            # calculate
-            d12 = self.distance.image_distance(walkers[i].state, walkers[j].state)
-            dist_mat[i][j] = d12
-            dist_mat[j][i] = d12
-            #print(f"Distance between walker {i} and {j}: {d12}")
-        #print(f"Distance matrix: {dist_mat}")
-        dl, n_bins = self.distance.intensity_calculation(n_walkers= len(walkers) ,path = folder,n_d = n_d, it = it, n_bins = n_bins,max_bins = max_bins)
-        #print(f"Calculated distances: {dl}")
-        #print(f"Number of bins: {n_bins}")
-        return dl, [walker_dists for walker_dists in dist_mat], images , n_bins
+        # Per-walker intensities + adaptive bin count.
+        if self.use_cv_history:
+            # Disk-free analysis: consume the in-memory accumulated histories.
+            dranges = self._update_cv_histories(walkers, folder, n_d)
+            projections = self._cv_history.as_list()
+            dl, n_bins = self.distance.intensity_from_projections(
+                projections, dranges, n_d=n_d, it=it,
+                n_bins=n_bins, max_bins=max_bins)
+        else:
+            # Legacy path: re-read and re-project each walker's full DCD.
+            dl, n_bins = self.distance.intensity_calculation(
+                n_walkers=len(walkers), path=folder, n_d=n_d, it=it,
+                n_bins=n_bins, max_bins=max_bins)
+
+        return dl, [row for row in dist_mat], images, n_bins
 
     @log_call(include_args=[],
               include_result=False)
@@ -405,6 +447,12 @@ class CoWERAResampler(CloneMergeResampler):
 
         # update trajectory files according to the resampling data
         update_dcd_files(resampling_data, dcd_folder = dcd_folder)
+
+        # mirror the clone/merge reorganization in the in-memory CV histories so
+        # that next cycle's incremental update continues from the correct
+        # parent history for each (possibly cloned) walker slot.
+        if self.use_cv_history and self._cv_history is not None:
+            self._cv_history.reindex(resampling_data)
 
         # actually do the cloning and merging of the walkers
         resampled_walkers = self.DECISION.action(walkers, [resampling_data])

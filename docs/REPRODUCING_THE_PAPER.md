@@ -1,0 +1,203 @@
+# Reproducing the CoWERA Paper Results
+
+This guide reproduces the chignolin and Trp-cage folding/unfolding kinetics
+reported in Shahid, Maity & Chakrabarty, *J. Chem. Phys.* **164**, 134111 (2026)
+(Tables I–III, Figs. 3–5), using the parameters from **Table I** of the paper.
+
+> Requires a CUDA GPU and the full environment (`env/environment.yml`:
+> OpenMM, mdtraj, MDAnalysis, ruptures). The algorithm-core unit tests in
+> `Scripts/tests/` run without any of these — see the bottom of this page.
+
+---
+
+## 1. Parameter mapping (Table I → `config.yml`)
+
+CoWERA's config fields relate to the paper's symbols as follows (integration
+timestep `dt = 0.002 ps`):
+
+| Paper symbol | Meaning | config field | Conversion |
+|---|---|---|---|
+| `ΔT` | resampling interval (ps) | `n_steps` | `n_steps = ΔT / dt` |
+| `f` | CV save interval (ps) | `save_freq` | `save_freq = f / dt` (gives `n_d = n_steps/save_freq`) |
+| `P` | progress coordinate | `sel_feat` | `Q → best_hummer_q`, `RMSD → rmsd_backbone` |
+| `D_warp` | warping cutoff from target | `d_warped` | direct |
+| `D_merge` | merge cutoff | `d_merge` | direct |
+| `p_max` | max walker probability | `pmax` | direct |
+| `N_c` | # native contacts → bins | `n_bins`, `max_bins` | 29 (chignolin), 122 (Trp-cage) |
+| direction | folding vs unfolding | `increment` | see below |
+
+**Direction / `increment` and `I0`.** The sign of `increment` selects the
+target direction *and* the functional form of the initial intensity `I0`
+(implemented in `metric.scale_weights`):
+
+* `increment = +1` → `I0 = (P − P_min)/(P_max − P_min)`
+* `increment = -1` → `I0 = 1 − (P − P_min)/(P_max − P_min)`
+
+Matching Table I:
+
+| System | Process | `sel_feat` | `increment` |
+|---|---|---|---|
+| Chignolin | Folding | `rmsd_backbone` | `-1` |
+| Chignolin | Unfolding | `rmsd_backbone` | `+1` |
+| Trp-cage | Folding | `best_hummer_q` | `+1` |
+| Trp-cage | Unfolding | `best_hummer_q` | `-1` |
+
+All four use **16 walkers** and `mode: probabilistic`.
+
+---
+
+## 2. Example configs
+
+Place these as `Systems/<system>/config.yml`. Files (`*.gro`, `topol.top`,
+`system.py`, etc.) must already be present per the main `README.md`.
+
+### Trp-cage folding (Table I, row 3; Table III: MFPT ≈ 14 µs)
+```yaml
+system: "Trp-cage"
+dir: "./Systems/TC10b Trp-cage"
+
+num_walkers: 16
+pmax: 0.25
+run: "fold_0"
+n_steps: 50000      # ΔT = 100 ps
+n_cycles: 20000
+save_freq: 5000     # f = 10 ps  -> n_d = 10
+
+start: "unfolded.gro"
+topol: "topol.top"
+target: "folded.gro"
+native: "folded.gro"
+
+sel_feat: "best_hummer_q"
+mode: "probabilistic"
+distance_criterion: "pairwise_rmsd"
+
+d_merge: 0.6
+d_warped: 0.3
+
+temp: 290.0
+gpu_ids: [0]
+
+n_bins: 122
+max_bins: 122
+increment: 1
+output_folder: "folding_runs"
+```
+
+### Trp-cage unfolding (Table I, row 4; Table III: MFPT ≈ 3 µs)
+Same as above with:
+```yaml
+run: "unfold_0"
+n_steps: 25000      # ΔT = 50 ps
+start: "folded.gro"
+target: "unfolded.gro"
+increment: -1
+output_folder: "unfolding_runs"
+```
+
+### Chignolin folding (Table I, row 1; Table II: K ≈ 0.96×10⁷ s⁻¹)
+```yaml
+system: "chignolin"
+dir: "./Systems/chignolin"
+
+num_walkers: 16
+pmax: 0.20
+run: "fold_0"
+n_steps: 1000       # ΔT = 2 ps
+n_cycles: 20000
+save_freq: 100      # f = 0.2 ps -> n_d = 10
+
+start: "unfolded.gro"
+topol: "topol.top"
+target: "folded.gro"
+native: "folded.gro"
+
+sel_feat: "rmsd_backbone"
+mode: "probabilistic"
+distance_criterion: "pairwise_rmsd"
+
+d_merge: 0.1        # nm
+d_warped: 0.05      # nm
+temp: 340.0
+gpu_ids: [0]
+
+n_bins: 29
+max_bins: 29
+increment: -1
+output_folder: "folding_runs"
+```
+
+### Chignolin unfolding (Table I, row 2; Table II: K ≈ 0.69×10⁷ s⁻¹)
+Same as chignolin folding with:
+```yaml
+run: "unfold_0"
+n_steps: 5000       # ΔT = 10 ps
+save_freq: 1000     # f = 2 ps -> n_d = 5
+start: "folded.gro"
+target: "unfolded.gro"
+d_warped: 0.145     # nm
+increment: 1
+output_folder: "unfolding_runs"
+```
+
+---
+
+## 3. Running
+
+Enable CUDA MPS to pack multiple walkers onto each physical GPU, then launch:
+
+```bash
+nvidia-cuda-mps-control -d
+export CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=20   # tune to GPU memory / walker count
+
+python ./Scripts/run_cowera.py --config ./Systems/TC10b\ Trp-cage/config.yml
+```
+
+For statistics matching the paper, run **multiple independent replicas** by
+changing `run:` (e.g. `fold_0 … fold_4`) — the paper reports block-averaged
+estimates with confidence intervals across replicas.
+
+On a multi-GPU workstation, list every device in `gpu_ids` (e.g. `[0, 1, 2, 3]`);
+walkers are distributed across the listed GPUs.
+
+---
+
+## 4. Analysis (Tables II–III, Figs. 3–5)
+
+After a run, results live in
+`Systems/<system>/<output_folder>/simdata_run<run>_steps<n_steps>_cycs<n_cycles>/`
+(`wepy.results.h5`, `trajectories/`, `Info_<run>.txt`).
+
+Use `Analysis/WE_analysis.ipynb` to:
+
+1. Accumulate warped-walker weight `Σ_t w_target(t)` and apply the Hill relation
+   `MFPT = T_total / Σ_t w_target(t)` (Eq. 7); `k = 1/MFPT`.
+2. Interpolate aggregated probability onto a common time grid (20 ps window for
+   chignolin, 0.5 ns for Trp-cage) across replicas.
+3. Identify the converged regime (chignolin: ~6–7.5 ns; Trp-cage: ~23–74 ns) and
+   block-average beyond it for the rate/MFPT and confidence intervals.
+
+**Expected targets**
+
+| System | Process | Reference (unbiased MD) | CoWERA |
+|---|---|---|---|
+| Chignolin | Unfolding | K = 1.3 (0.9, 1.8) ×10⁷ s⁻¹ | 0.69 (0.56, 0.83) |
+| Chignolin | Folding | K = 0.71 (0.44, 1.24) ×10⁷ s⁻¹ | 0.96 (0.74, 1.18) |
+| Trp-cage | Folding | MFPT = 14 ± 4 µs | 14.38 ± 0.27 |
+| Trp-cage | Unfolding | MFPT = 3 ± 1 µs | 3.50 ± 0.11 |
+
+---
+
+## 5. Validating the algorithm cores without a GPU
+
+The coherence/intensity machinery (Eqs. 3–6, Appendices B–F) is unit-tested in
+pure NumPy and runs anywhere:
+
+```bash
+python -m pytest Scripts/tests/ -v
+python Scripts/tests/bench_hotpaths.py
+```
+
+These pin down the phase/intensity formulas and the edge-case bug fixes
+(degenerate phases, empty segments, changepoint window), and demonstrate the
+CPU hot-path speedups described in `docs/ANALYSIS_AND_OPTIMIZATION.md`.
