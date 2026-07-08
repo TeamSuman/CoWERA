@@ -121,6 +121,7 @@ distance_criterion = args.distance_criterion
 # platforms (CPU/Reference/OpenCL) let CoWERA run on CPU-only HPC nodes.
 restart        = args.restart
 checkpoint_freq = getattr(args, "checkpoint_freq", 10)
+scratch_dir    = getattr(args, "scratch_dir", None)
 platform_name  = getattr(args, "platform", "CUDA")
 platform_kwargs = getattr(args, "platform_kwargs", None)
 _GPU_PLATFORMS = ("CUDA", "OpenCL")
@@ -247,9 +248,40 @@ if __name__ == "__main__":
         open(info_file_path, 'w').close()
 
     #select folder for dcd files
-    dcd_folder = f'{outputs_dir}/trajectories/'
+    final_dcd_folder = f'{outputs_dir}/trajectories/'
+    os.makedirs(final_dcd_folder, exist_ok=True)
 
-    os.makedirs(dcd_folder, exist_ok=True)
+    if scratch_dir:
+        # Node-local scratch: the many small per-cycle DCD read/append/copy/remove
+        # operations run on fast local disk instead of a shared parallel filesystem
+        # (Lustre/GPFS), which they would otherwise hammer with metadata ops. The
+        # durable checkpoints (pkls/) and results (h5) stay on the output dir so a
+        # restart still works. Trajectories are synced back on exit.
+        dcd_folder = osp.join(scratch_dir,
+                              f'cowera_run{run}_steps{n_steps}_cycs{n_cycles}',
+                              'trajectories') + os.sep
+        os.makedirs(dcd_folder, exist_ok=True)
+
+        # On restart, re-stage any previously synced trajectories to scratch so the
+        # in-memory CV histories can rebuild from them.
+        if restart:
+            for fname in os.listdir(final_dcd_folder):
+                shutil.copy(osp.join(final_dcd_folder, fname), osp.join(dcd_folder, fname))
+
+        def _sync_trajectories_back():
+            try:
+                os.makedirs(final_dcd_folder, exist_ok=True)
+                for fname in os.listdir(dcd_folder):
+                    shutil.copy(osp.join(dcd_folder, fname), osp.join(final_dcd_folder, fname))
+                print(f"Synced trajectories from scratch -> {final_dcd_folder}")
+            except Exception as exc:
+                print(f"Warning: failed to sync trajectories from scratch ({exc}).")
+
+        import atexit
+        atexit.register(_sync_trajectories_back)
+        print(f"{Fore.CYAN}Trajectories staged on node-local scratch: {dcd_folder}")
+    else:
+        dcd_folder = final_dcd_folder
 
 
     system_file = os.path.join(inp_path, "system.py")

@@ -236,3 +236,10 @@ history_window: null
 
 # Subdirectory inside system DIR to store results
 output_folder: "unfolding_runs"
+
+# Optional node-local scratch directory (e.g. "$TMPDIR" on SLURM/PBS). When set,
+# the high-churn per-walker trajectory (DCD) I/O is staged on fast local disk and
+# synced back to the output directory on exit, sparing shared parallel filesystems
+# (Lustre/GPFS). Checkpoints and the results file stay on the output directory so
+# restarts still work. Leave null to write trajectories directly to output_folder.
+scratch_dir: null
