@@ -17,7 +17,7 @@ import mdtraj as mdj
 import warnings
 warnings.filterwarnings("ignore")
 
-from wepy.runners.openmm import OpenMMGPUWalkerTaskProcess, OpenMMRunner, OpenMMWalker, OpenMMState, gen_sim_state
+from wepy.runners.openmm import OpenMMGPUWalkerTaskProcess, OpenMMCPUWalkerTaskProcess, OpenMMRunner, OpenMMWalker, OpenMMState, gen_sim_state
 from wepy.reporter.hdf5 import WepyHDF5Reporter
 from wepy.work_mapper.task_mapper import TaskMapper
 from wepy.util.mdtraj import mdtraj_to_json_topology
@@ -58,6 +58,11 @@ def get_args():
         args = argparse.Namespace(**cfg)
     else:
         raise ValueError("Please provide a configuration file using --config")
+
+    # ``gpu_ids`` is optional for CPU/Reference execution; default to an empty
+    # list so len()/derived parameters stay well-defined.
+    if not hasattr(args, "gpu_ids") or args.gpu_ids is None:
+        args.gpu_ids = []
 
     # Derived parameters (same as before)
     args.n_gpu = len(args.gpu_ids)
@@ -104,6 +109,20 @@ output_folder  = args.output_folder
 pmax           = args.pmax
 mode           = args.mode
 distance_criterion = args.distance_criterion
+
+# Compute platform selection (default CUDA preserves prior behaviour). Non-CUDA
+# platforms (CPU/Reference/OpenCL) let CoWERA run on CPU-only HPC nodes.
+platform_name  = getattr(args, "platform", "CUDA")
+platform_kwargs = getattr(args, "platform_kwargs", None)
+_GPU_PLATFORMS = ("CUDA", "OpenCL")
+is_gpu_platform = platform_name in _GPU_PLATFORMS
+# Number of concurrent walker worker processes. For GPU platforms this is the
+# number of device slots (len(gpu_ids), repeated ids => MPS packing); for CPU it
+# is an explicit ``n_workers`` (default: 1, or n_gpu if that was set).
+if is_gpu_platform:
+    num_workers = n_gpu
+else:
+    num_workers = getattr(args, "n_workers", None) or (n_gpu if n_gpu > 0 else 1)
 
 # Determine folding or unfolding and set target behavior
 
@@ -156,6 +175,8 @@ def flashy_banner():
     print(f"{Fore.MAGENTA}{Style.BRIGHT}Temperature:      {Fore.WHITE}{temp} K")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}Walkers:          {Fore.WHITE}{num_walkers}")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}Max Walker Prob:  {Fore.WHITE}{pmax}")
+    print(f"{Fore.MAGENTA}{Style.BRIGHT}Platform:         {Fore.WHITE}{platform_name}")
+    print(f"{Fore.MAGENTA}{Style.BRIGHT}Workers:          {Fore.WHITE}{num_workers}")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}GPUs:             {Fore.WHITE}{gpu_ids}  (Total: {n_gpu})")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}Steps per cycle:  {Fore.WHITE}{n_steps}")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}Total cycles:     {Fore.WHITE}{n_cycles}")
@@ -285,7 +306,8 @@ if __name__ == "__main__":
     #target_state = gen_sim_state(tar_pos, system, integrator)
 
     # set up the OpenMMRunner with your system
-    runner = OpenMMRunner(system, top.topology, integrator, platform='CUDA',dcd_folder=dcd_folder, save_freq=save_freq)
+    runner = OpenMMRunner(system, top.topology, integrator, platform=platform_name,
+                          platform_kwargs=platform_kwargs, dcd_folder=dcd_folder, save_freq=save_freq)
 
     # Select the feature
     sel_feat = sel_feat
@@ -439,11 +461,21 @@ if __name__ == "__main__":
                                         runner_dash = openmm_dashboard_sec)
 
 
-    # Create a work mapper for NVIDIA GPUs for a GPU cluster
-    mapper = TaskMapper(walker_task_type=OpenMMGPUWalkerTaskProcess,
-                        num_workers=n_gpu,
-                        platform='CUDA',
-                        device_ids=gpu_ids)
+    # Create a work mapper. GPU platforms (CUDA/OpenCL) assign a device per worker
+    # slot via DeviceIndex; CPU/Reference platforms use a device-agnostic task type.
+    if is_gpu_platform:
+        if not gpu_ids:
+            raise ValueError(
+                f"platform '{platform_name}' requires a non-empty 'gpu_ids' list in the config."
+            )
+        mapper = TaskMapper(walker_task_type=OpenMMGPUWalkerTaskProcess,
+                            num_workers=num_workers,
+                            platform=platform_name,
+                            device_ids=gpu_ids)
+    else:
+        mapper = TaskMapper(walker_task_type=OpenMMCPUWalkerTaskProcess,
+                            num_workers=num_workers,
+                            platform=platform_name)
 
 
     # Build the simulation manager

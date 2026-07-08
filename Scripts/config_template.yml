@@ -137,11 +137,33 @@ temp: 290.0
 
 
 # ===============================================================
+# 🖥  COMPUTE PLATFORM
+# ===============================================================
+
+# OpenMM compute platform. Default: "CUDA" (unchanged prior behaviour).
+#   "CUDA"      → NVIDIA GPUs (requires gpu_ids)
+#   "OpenCL"    → GPUs via OpenCL (requires gpu_ids)
+#   "CPU"       → multithreaded CPU (no GPU; set n_workers)
+#   "Reference" → single-thread reference CPU (slow; testing only)
+platform: "CUDA"
+
+# Optional OpenMM platform properties, e.g. {Precision: mixed} for CUDA or
+# {Threads: "4"} for the CPU platform. Leave null for platform defaults.
+platform_kwargs: null
+
+# Number of concurrent walker worker processes for CPU/Reference platforms.
+# Ignored for GPU platforms, where the number of workers is len(gpu_ids).
+n_workers: 4
+
+
+# ===============================================================
 # 🎮 GPU CONFIGURATION
 # ===============================================================
 
-# List of GPU device IDs for CUDA execution
-# Repeat IDs if using CUDA MPS
+# List of GPU device IDs for CUDA/OpenCL execution (indexes the
+# scheduler-VISIBLE devices; under SLURM/PBS CUDA_VISIBLE_DEVICES is
+# renumbered 0..N-1). Repeat IDs to pack multiple walkers per GPU with MPS.
+# Leave empty ([]) for CPU/Reference platforms.
 #
 # Example:
 #   [0,0,0,0,0] → 5 walkers sharing GPU 0 via MPS
