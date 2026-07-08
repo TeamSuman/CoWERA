@@ -111,6 +111,16 @@ mode: "probabilistic"
 #   - "euclidean"      (distance in CV space)
 distance_criterion: "euclidean"
 
+# Initial intensity I0 form (paper Appendix C):
+#   "projection" -> I0 is the min-max scaled projection (default, CoWERA)
+#   "uniform"    -> I0 = 1 for all walkers
+i0_mode: "projection"
+
+# Include the coherence phase in the intensity (default true = CoWERA). Set false
+# to reproduce the paper's proximity-only TARGETED-WE baseline (intensity = I0,
+# i.e. resample purely by distance to the target, phase omitted).
+use_phase: true
+
 
 
 # ===============================================================

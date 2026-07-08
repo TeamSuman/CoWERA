@@ -62,13 +62,19 @@ def scale_phases(phases):
     return 2.0 * (phases - pmin) / (pmax - pmin) - 1.0
 
 
-def scale_weights(weights, increment):
-    """Min-max scale the per-walker initial intensity I0 (function of projection).
+def scale_weights(weights, increment, i0_mode="projection"):
+    """Compute the per-walker initial intensity I0 (paper Appendix C).
 
-    Returns 0.5 for all walkers when the range is degenerate so that the
-    resulting intensities stay finite and uniform.
+    ``i0_mode="projection"`` (default): min-max scale the projection (0.5 for all
+    walkers when the range is degenerate), directed by ``increment``.
+    ``i0_mode="uniform"``: I0 = 1 for every walker (the paper's "uniformly one"
+    option). Any other value raises.
     """
     weights = np.asarray(weights, dtype=float)
+    if i0_mode == "uniform":
+        return np.ones_like(weights)
+    if i0_mode != "projection":
+        raise ValueError(f"Unrecognized i0_mode: {i0_mode!r} (use 'projection' or 'uniform')")
     wmin = weights.min()
     wmax = weights.max()
     if wmax - wmin < 1e-12:
@@ -78,13 +84,20 @@ def scale_weights(weights, increment):
     return np.where(increment == 1, scaled, 1.0 - scaled)
 
 
-def compute_intensity(weights_scaled, phases_scaled):
+def compute_intensity(weights_scaled, phases_scaled, use_phase=True):
     """Combine scaled I0 and scaled phase into normalized intensity (Eq. 4/C4).
 
     ``interference = I0_scaled * sqrt(1 + phase_scaled)`` then normalized by its
     max. Guards against an all-zero interference vector.
+
+    ``use_phase=False`` drops the coherence phase entirely (``interference = I0``),
+    reducing CoWERA to the proximity-only *targeted-WE baseline* of the paper's
+    comparison (resampling guided solely by I0, i.e. distance to the target).
     """
-    interference = weights_scaled * np.sqrt(1.0 + phases_scaled)
+    if use_phase:
+        interference = weights_scaled * np.sqrt(1.0 + phases_scaled)
+    else:
+        interference = np.asarray(weights_scaled, dtype=float)
     imax = interference.max()
     if imax <= 0.0:
         return np.ones_like(interference) / max(len(interference), 1)
@@ -112,7 +125,8 @@ def relevant_change_points(changes, n_d):
 
 class Calculate_Distances:
     def __init__(self, feat, increment, native_file=None, init_file=None, tar_file=None,
-                 top_file=None, distance_criterion="pairwise_rmsd"):
+                 top_file=None, distance_criterion="pairwise_rmsd",
+                 i0_mode="projection", use_phase=True):
         super().__init__()
         self._feat = feat
         self.native_file = native_file
@@ -121,6 +135,10 @@ class Calculate_Distances:
         self.top_file = top_file
         self.increment = increment
         self.distance_criterion = distance_criterion
+        # I0 form (Appendix C) and whether the coherence phase is used. use_phase
+        # False + i0_mode 'projection' reproduces the paper's targeted-WE baseline.
+        self.i0_mode = i0_mode
+        self.use_phase = use_phase
 
         # Cache for the MDAnalysis reference topology used by the pairwise-RMSD
         # criterion, built once and reused (previously two Universes were
@@ -389,7 +407,7 @@ class Calculate_Distances:
         phases = np.array(phase_arr, dtype=float)
         weights = np.array(weight_arr, dtype=float)
 
-        weights_scaled = scale_weights(weights, self.increment)
+        weights_scaled = scale_weights(weights, self.increment, self.i0_mode)
         phases_scaled = scale_phases(phases)
 
         fraction_unique = np.mean([
@@ -401,7 +419,7 @@ class Calculate_Distances:
         elif fraction_unique > 0.8:
             n_bins = max(10, int((n_bins - 1) * bin_decrease_factor))
 
-        intensity = compute_intensity(weights_scaled, phases_scaled)
+        intensity = compute_intensity(weights_scaled, phases_scaled, self.use_phase)
         return intensity, n_bins
 
     def intensity_from_projections(self, projections, dranges, n_d, it,

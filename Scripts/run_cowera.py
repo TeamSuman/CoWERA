@@ -492,9 +492,15 @@ if __name__ == "__main__":
         init_walkers = [OpenMMWalker(walker_state, init_weight) for i in range(num_walkers)]
 
 
+    # I0 form and phase usage (paper Appendix C). Defaults reproduce CoWERA;
+    # i0_mode='uniform' and/or use_phase=false reproduce the paper's baselines.
+    i0_mode = getattr(args, "i0_mode", "projection")
+    use_phase = getattr(args, "use_phase", True)
+
     # Distance metric to be used in resampling
     proj_distance = Calculate_Distances(sel_feat, increment=increment, native_file=native_path, init_file=start_path,
-                                        tar_file=tar_path, top_file=native_path, distance_criterion=distance_criterion)
+                                        tar_file=tar_path, top_file=native_path, distance_criterion=distance_criterion,
+                                        i0_mode=i0_mode, use_phase=use_phase)
 
     #init_rmsd = proj_distance.image_distance(walker_state, target_walker_state)
     #print(f"Initial rmsd distance from target: {init_rmsd}")
