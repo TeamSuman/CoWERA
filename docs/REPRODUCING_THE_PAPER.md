@@ -96,6 +96,8 @@ output_folder: "unfolding_runs"
 ```
 
 ### Chignolin folding (Table I, row 1; Table II: K ≈ 0.96×10⁷ s⁻¹)
+The runnable version ships as `Systems/chignolin/config.yml` (uses the shipped
+AMBER inputs `chignolin_*.pdb` + `chignolin.prmtop`). Table-I parameters:
 ```yaml
 system: "chignolin"
 dir: "./Systems/chignolin"
@@ -107,14 +109,14 @@ n_steps: 1000       # ΔT = 2 ps
 n_cycles: 20000
 save_freq: 100      # f = 0.2 ps -> n_d = 10
 
-start: "unfolded.gro"
-topol: "topol.top"
-target: "folded.gro"
-native: "folded.gro"
+start: "chignolin_unfolded.pdb"
+topol: "chignolin.prmtop"
+target: "chignolin_folded.pdb"
+native: "chignolin_folded.pdb"
 
 sel_feat: "rmsd_backbone"
 mode: "probabilistic"
-distance_criterion: "pairwise_rmsd"
+distance_criterion: "euclidean"   # |ΔRMSD| in CV space (shipped config); "pairwise_rmsd" also valid
 
 d_merge: 0.1        # nm
 d_warped: 0.05      # nm
@@ -133,8 +135,8 @@ Same as chignolin folding with:
 run: "unfold_0"
 n_steps: 5000       # ΔT = 10 ps
 save_freq: 1000     # f = 2 ps -> n_d = 5
-start: "folded.gro"
-target: "unfolded.gro"
+start: "chignolin_folded.pdb"
+target: "chignolin_unfolded.pdb"
 d_warped: 0.145     # nm
 increment: 1
 output_folder: "unfolding_runs"
