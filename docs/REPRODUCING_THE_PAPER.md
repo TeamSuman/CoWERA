@@ -118,7 +118,7 @@ distance_criterion: "pairwise_rmsd"
 
 d_merge: 0.1        # nm
 d_warped: 0.05      # nm
-temp: 340.0
+temp: 275.0         # matches supp.tex (NVT, 275 K) and Systems/chignolin/system.py
 gpu_ids: [0]
 
 n_bins: 29

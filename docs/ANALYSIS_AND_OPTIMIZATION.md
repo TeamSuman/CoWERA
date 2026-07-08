@@ -146,6 +146,15 @@ compatibility wrappers. The resampler uses the in-memory path by default
 unit-tested (`Scripts/tests/test_cv_history.py`). The remaining disk read of the
 *new* segment is the final seam removed in Phase 3 (runner-supplied CVs).
 
+> **Update.** As originally landed, `metric.project_new_frames` still re-projected
+> each walker's *entire* DCD every cycle (it called `_load_projection` without the
+> `frame_slice`), so the O(T)→O(segment) projection win above was not actually
+> realized. This is now fixed: only the frames beyond the stored offset are
+> projected (the per-frame CV is frame-independent, so the result is numerically
+> identical). The DCD is still *read* in full; eliminating that read is the
+> Phase-4 runner-inline-CV item. See also `docs/MANUSCRIPT_CONSISTENCY.md` for
+> code↔paper parameter reconciliations.
+
 > Validation note: the `CVHistory` building blocks are unit-tested here, but the
 > integrated resampler path requires the full MD stack + GPU and must be
 > validated on the simulation host before this phase is merged to `main`.
