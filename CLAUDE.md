@@ -80,15 +80,17 @@ restart/checkpoint, SLURM/PBS scripts, scoped warnings + CV-fallback counter, se
 persistent per-GPU cached Context, `scratch_dir` staging, joblib CPU-alloc awareness, doc reconciliation,
 `i0_mode`/`use_phase` baselines. 52 pure-numpy tests pass; OpenMM paths have `-m integration` tests.
 
-### P0 — Profile first (prerequisite)
-- Build `Scripts/tools/bench_run.py`: instrument each cycle into buckets — GPU propagation (runner
-  already records `gen_sim_time`/`steps_time`/`get_state_time`), warp/BC, resampling analysis
-  (projection, changepoint, distance matrix, `decide` loop), reporting/I/O, and mapper overhead
-  (fork / `mp.Manager` / state serialization). Emit per-cycle CSV + a summary breakdown.
-- Capture **GPU utilization** (`nvidia-smi dmon` or `pynvml`) and CPU utilization during a run.
-- Profile on the GPU host for **chignolin** (short ΔT = 1000 steps — worst case for per-cycle overhead,
-  best at exposing bottlenecks) and **Trp-cage**. Output = a wall-clock breakdown + GPU-idle fraction
-  that drives the priorities below. Land this + a baseline number before touching hot code.
+### P0 — Profile first (prerequisite) — ✅ LANDED (commit 29f9819)
+Harness built (behind config `profile: false`): `cowera/timing_reporter.py` (per-cycle wall-clock
+breakdown → `<output>/profile.csv`, consuming the sim-manager timings + resampler `_last_subtimings`),
+`tools/gpu_monitor.py` (GPU util/mem sampler), `tools/bench_run.py` (ranks the buckets + GPU-idle %).
+6 unit tests. **Remaining (host):** run on the GPU host for chignolin (short ΔT = 1000 steps — worst
+case) and Trp-cage, record the baseline, and let the ranked breakdown confirm the P1–P5 order:
+```
+python Scripts/tools/gpu_monitor.py --out gpu_util.csv &   # then run with profile: true
+python Scripts/run_cowera.py --config ./Systems/chignolin/config.yml
+python Scripts/tools/bench_run.py --profile-csv <output>/profile.csv --gpu-csv gpu_util.csv
+```
 
 ### P1 — Make persistent workers + cached Context the default (biggest win)
 - Validate the existing opt-in path on the host; make `persistent_workers` the default for GPU. Removes
@@ -177,6 +179,12 @@ separable.
 
 ## Continuation notes
 
+- **Execution environments (set by the user).** Remote **HPC cluster with GPUs** = all profiling, GPU
+  runs, OpenMM validation, and large/long workloads. Local **workstation = CPU-only, ≤8 cores** = pure
+  logic, unit tests, small CPU-platform smoke runs. So: build + unit-test on local; run the A0 profiler,
+  validate the persistent-Context / runner-inline-CV / any OpenMM change, and do the WESTPA benchmark on
+  the remote. Prefer landing a refactor with live validation in the loop on the remote over building large
+  unvalidated OpenMM code blind on local.
 - **Branch:** `feature/hpc-cluster-enhancements` (off `main`; not pushed). Cadence: small CPU-tested
   commits; validate OpenMM/GPU paths on the host before merging → `devel` → `main`.
 - **Needs GPU/host validation** (no OpenMM/mdtraj/ruptures + no GPU in this dev env): restart HDF5
