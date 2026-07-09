@@ -219,6 +219,11 @@ max_bins: 122
 # values lose less work if a job is killed. Default: 10.
 checkpoint_freq: 10
 
+# Write a per-cycle wall-clock breakdown to <output>/profile.csv (propagation vs
+# resampling analysis vs warp vs work-mapper overhead). For performance profiling;
+# leave false for production. Pair with Scripts/tools/gpu_monitor.py for GPU util.
+profile: false
+
 # Resume from the newest checkpoint in the output directory instead of starting
 # fresh. Equivalent to passing --restart on the command line. On restart the
 # output directory, trajectories and results file are preserved (never clobbered)

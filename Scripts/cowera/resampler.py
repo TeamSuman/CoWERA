@@ -1,4 +1,5 @@
 import random as rand
+import time
 
 import logging
 from eliot import start_action, log_call
@@ -155,6 +156,10 @@ class CoWERAResampler(CloneMergeResampler):
         # Running total of feature-read fallbacks at the previous cycle, so we can
         # report the per-cycle delta (a nonzero value flags CV corruption risk).
         self._prev_fallback_count = 0
+
+        # Fine-grained resampling-analysis sub-timings from the last get_dist call
+        # (populated for the profiler; empty until the first resample).
+        self._last_subtimings = {}
 
         # we do not know the shape and dtype of the images until
         # runtime so we determine them here
@@ -384,13 +389,16 @@ class CoWERAResampler(CloneMergeResampler):
     def get_dist(self, walkers, folder, n_d, it, n_bins, max_bins):
 
         # Per-walker projection (image) onto the progress coordinate.
+        _t0 = time.perf_counter()
         images = [self.distance.get_proj_coord(walker.state)[0] for walker in walkers]
+        _t1 = time.perf_counter()
 
         # Full symmetric pairwise distance matrix, computed in a single
         # vectorized pass that reuses one cached topology/backbone selection
         # (previously this constructed two MDAnalysis Universes for *every*
         # walker pair, every cycle).
         dist_mat = self.distance.pairwise_distance_matrix(walkers)
+        _t2 = time.perf_counter()
 
         # Per-walker intensities + adaptive bin count.
         if self.use_cv_history:
@@ -409,6 +417,15 @@ class CoWERAResampler(CloneMergeResampler):
                 n_bins=n_bins, max_bins=max_bins,
                 bin_increase_factor=self.bin_increase_factor,
                 bin_decrease_factor=self.bin_decrease_factor)
+        _t3 = time.perf_counter()
+
+        # Fine-grained resampling-analysis timings for the profiler (A0). Cheap;
+        # read by the timing reporter, ignored otherwise.
+        self._last_subtimings = {
+            'images_time': _t1 - _t0,       # per-walker projection of current state
+            'distmat_time': _t2 - _t1,      # O(N^2) pairwise distance matrix
+            'intensity_time': _t3 - _t2,    # CV history update + changepoint + intensity
+        }
 
         return dl, [row for row in dist_mat], images, n_bins
 

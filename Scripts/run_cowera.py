@@ -43,6 +43,7 @@ from cowera.metric import Calculate_Distances
 from cowera.resampler import CoWERAResampler
 from cowera.warper import TargetBC
 from cowera.sim_manager import Manager
+from cowera.timing_reporter import TimingReporter
 
 import yaml
 import argparse
@@ -134,6 +135,7 @@ checkpoint_freq = getattr(args, "checkpoint_freq", 10)
 scratch_dir    = getattr(args, "scratch_dir", None)
 seed           = getattr(args, "seed", None)
 deterministic_dynamics = getattr(args, "deterministic_dynamics", False)
+profile        = getattr(args, "profile", False)
 # Reporters save only positions + box_vectors; velocities are retained for state
 # fidelity across clone/merge/warp. Forces/energy/parameters/derivatives are
 # fetched every segment but discarded, so trim them by default to cut GPU->CPU
@@ -627,6 +629,12 @@ if __name__ == "__main__":
                             platform=platform_name)
 
 
+    # Assemble reporters; add the per-cycle timing profiler when profile: true.
+    reporters = [hdf5_reporter, pkl_reporter, dashboard_reporter]
+    if profile:
+        reporters.append(TimingReporter(save_path=osp.join(outputs_dir, 'profile.csv')))
+        print(f"{Fore.CYAN}Profiling enabled -> {osp.join(outputs_dir, 'profile.csv')}")
+
     # Build the simulation manager. On restart resume the adaptive bin count
     # snapshotted in the checkpoint so the bin resolution stays continuous.
     active_n_bins = restored_n_bins if (restart and restored_n_bins is not None) else n_bins
@@ -635,7 +643,7 @@ if __name__ == "__main__":
                           resampler=resampler,
                           boundary_conditions=tbc,
                           work_mapper=mapper,
-                          reporters=[hdf5_reporter, pkl_reporter, dashboard_reporter],
+                          reporters=reporters,
                           n_bins=active_n_bins,
                           max_bins = max_bins,
                           outputs_dir=outputs_dir
