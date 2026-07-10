@@ -26,12 +26,14 @@ BUCKETS = [
     ("runner_time", "GPU propagation (segment phase)"),
     ("bc_time", "boundary/warp"),
     ("resampling_time", "resampling (total)"),
+    ("reporting_time", "reporting I/O (HDF5/pkl/dashboard/DCD)"),
     ("mapper_overhead", "work-mapper overhead (fork/serialize)"),
 ]
 SUB_BUCKETS = [
     ("images_time", "  - projection of current state"),
     ("distmat_time", "  - pairwise distance matrix O(N^2)"),
-    ("intensity_time", "  - CV history + changepoint + intensity"),
+    ("cv_update_time", "  - CV-history update: FULL DCD reload (A2 target)"),
+    ("intensity_time", "  - changepoint (P3b) + intensity/binning"),
 ]
 
 
@@ -47,28 +49,72 @@ def _floats(rows, key):
     return out
 
 
+def _mean(rows, key):
+    vals = _floats(rows, key)
+    return statistics.mean(vals) if vals else 0.0
+
+
 def summarize_profile(rows):
-    """Return a dict of {label: (mean_seconds, pct_of_cycle_wall)} plus meta."""
+    """Return a dict of {label: (mean_seconds, pct_of_wall)} plus meta.
+
+    Percentages are relative to the TRUE end-to-end cycle wall when the profile has
+    it (`true_cycle_wall`, added by the P0' profiler fix); older CSVs without it
+    fall back to the accounted `cycle_wall` (= runner+bc+resampling) so this stays
+    backward compatible.
+    """
     if not rows:
         return {"cycles": 0}
-    walls = _floats(rows, "cycle_wall")
-    mean_wall = statistics.mean(walls) if walls else 0.0
+    mean_accounted = _mean(rows, "cycle_wall")          # runner+bc+resampling (legacy)
+    mean_true = _mean(rows, "true_cycle_wall")           # real wall incl. reporting
+    mean_reporting = _mean(rows, "reporting_time")
+    mean_unacc = _mean(rows, "unaccounted")
+    denom = mean_true if mean_true > 0 else mean_accounted   # % denominator
+    nwalkers = [int(v) for v in _floats(rows, "n_walkers")]
+    # Aggregate MD throughput = walker-steps sampled per wall-second. This -- not
+    # GPU-util% -- is the efficiency metric that matters (for small systems/toy
+    # potentials GPU util is meaningless: tiny kernels can't fill the device). It
+    # answers "does adding walkers raise total sampling rate, or does overhead eat
+    # it?" GPU-hours-to-converged-kinetics is the ultimate metric (computed at
+    # convergence). Per cycle: n_walkers * n_segment_steps / true_cycle_wall.
+    throughput = None
+    ws_wall = []
+    for r in rows:
+        try:
+            nw = float(r.get("n_walkers")); ns = float(r.get("n_segment_steps"))
+            tw = float(r.get("true_cycle_wall") or r.get("cycle_wall") or 0)
+            if tw > 0 and nw > 0 and ns > 0:
+                ws_wall.append((nw * ns, tw))
+        except (TypeError, ValueError):
+            continue
+    if ws_wall:
+        throughput = sum(x for x, _ in ws_wall) / sum(t for _, t in ws_wall)
+    result_throughput = throughput
     result = {
         "cycles": len(rows),
-        "mean_cycle_wall_s": mean_wall,
-        "cycles_per_s": (1.0 / mean_wall) if mean_wall > 0 else float("inf"),
+        "throughput_walker_steps_per_s": result_throughput,
+        "mean_cycle_wall_s": mean_accounted,             # kept for back-compat callers
+        "mean_true_wall_s": mean_true,
+        "mean_reporting_s": mean_reporting,
+        "mean_unaccounted_s": mean_unacc,
+        "has_true_wall": mean_true > 0,
+        # walker population: min/max/last confirm steady state (CoWERA fixes N, so
+        # GPU-util-vs-N is a cross-run num_walkers scan, not within-run growth).
+        "n_walkers_min": min(nwalkers) if nwalkers else None,
+        "n_walkers_max": max(nwalkers) if nwalkers else None,
+        "n_walkers_last": nwalkers[-1] if nwalkers else None,
+        # fraction of true wall NOT in the accounted cycle_wall (the old blind spot)
+        "blind_spot_frac": ((denom - mean_accounted) / denom) if denom > 0 else 0.0,
+        "cycles_per_s": (1.0 / denom) if denom > 0 else float("inf"),
         "buckets": [],
         "sub_buckets": [],
     }
     for key, label in BUCKETS:
-        vals = _floats(rows, key)
-        m = statistics.mean(vals) if vals else 0.0
-        pct = (100.0 * m / mean_wall) if mean_wall > 0 else 0.0
+        m = _mean(rows, key)
+        pct = (100.0 * m / denom) if denom > 0 else 0.0
         result["buckets"].append((label, m, pct))
     for key, label in SUB_BUCKETS:
-        vals = _floats(rows, key)
-        m = statistics.mean(vals) if vals else 0.0
-        pct = (100.0 * m / mean_wall) if mean_wall > 0 else 0.0
+        m = _mean(rows, key)
+        pct = (100.0 * m / denom) if denom > 0 else 0.0
         result["sub_buckets"].append((label, m, pct))
     # rank the top-level buckets by time spent
     result["buckets"].sort(key=lambda t: t[1], reverse=True)
@@ -100,10 +146,27 @@ def _print_report(prof, gpu):
         print("no profile rows found.")
         return
     print(f"cycles                : {prof['cycles']}")
-    print(f"mean cycle wall       : {prof['mean_cycle_wall_s']*1e3:.2f} ms "
-          f"({prof['cycles_per_s']:.2f} cycles/s)")
+    if prof.get("n_walkers_max") is not None:
+        nmin, nmax, nlast = prof["n_walkers_min"], prof["n_walkers_max"], prof["n_walkers_last"]
+        steady = "steady" if nmin == nmax else f"varies {nmin}-{nmax}"
+        print(f"walkers (min/max/last): {nmin} / {nmax} / {nlast}  ({steady})")
+    thr = prof.get("throughput_walker_steps_per_s")
+    if thr:
+        print(f"THROUGHPUT            : {thr:,.0f} walker-steps/s  "
+              f"<- the efficiency metric (GPU-util% only matters for large systems)")
+    if prof.get("has_true_wall"):
+        print(f"TRUE cycle wall       : {prof['mean_true_wall_s']*1e3:.2f} ms "
+              f"({prof['cycles_per_s']:.2f} cycles/s)  <- trust this")
+        print(f"  accounted (r+bc+rs) : {prof['mean_cycle_wall_s']*1e3:.2f} ms")
+        print(f"  reporting I/O       : {prof['mean_reporting_s']*1e3:.2f} ms")
+        print(f"  unaccounted residual: {prof['mean_unaccounted_s']*1e3:.2f} ms")
+        print(f"  >> profiler blind spot (true not in accounted): "
+              f"{prof['blind_spot_frac']*100:.1f}%")
+    else:
+        print(f"mean cycle wall (acct): {prof['mean_cycle_wall_s']*1e3:.2f} ms "
+              f"({prof['cycles_per_s']:.2f} cycles/s)  [no true_cycle_wall in CSV]")
     print("-" * 64)
-    print("where the wall-clock goes (mean per cycle, ranked):")
+    print("where the wall-clock goes (mean per cycle, ranked, % of true wall):")
     for label, m, pct in prof["buckets"]:
         print(f"  {label:<40} {m*1e3:8.2f} ms  {pct:5.1f}%")
     print("  resampling breakdown:")
@@ -111,9 +174,12 @@ def _print_report(prof, gpu):
         print(f"  {label:<40} {m*1e3:8.2f} ms  {pct:5.1f}%")
     if gpu:
         print("-" * 64)
-        print(f"GPU utilization       : mean {gpu['mean_util_pct']:.1f}%  "
+        print(f"GPU util (DIAGNOSTIC)  : mean {gpu['mean_util_pct']:.1f}%  "
               f"median {gpu['median_util_pct']:.1f}%  "
               f"idle(<5%) {gpu['idle_frac']*100:.1f}% of samples")
+        print("  (only a meaningful lever for LARGE, GPU-bound systems; low util on a "
+              "small\n   system/toy potential is expected, not a defect -- optimize "
+              "throughput instead)")
     print("=" * 64)
 
 

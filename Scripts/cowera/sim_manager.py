@@ -361,6 +361,13 @@ class Manager(object):
                    runner_opts=None,
     ):
         """See run_cycle."""
+        # True end-to-end cycle wall-clock start. The profiled `cycle_wall` was
+        # historically only runner+bc+resampling, which OMITS the reporting phase
+        # below (HDF5/pkl/dashboard/DCD) -- up to ~50% of the real wall for
+        # persistent workers. Measure the real thing here and hand it, plus a
+        # dedicated reporting-time bucket, to the TimingReporter (see the
+        # instrumented reporter loop at the end of this method).
+        cycle_start = time.time()
         if runner_opts is None:
             runner_opts = {}
 
@@ -516,8 +523,20 @@ class Manager(object):
                     for rep_key in self.REPORT_ITEM_KEYS])
 
         logging.info("Starting reporting")
-        # report results to the reporters
+        # Report to all reporters, TIMING the reporting phase (HDF5/pkl/dashboard/
+        # DCD I/O) which was previously unaccounted. Any reporter that consumes the
+        # cycle timing (the TimingReporter) must run LAST with the completed
+        # picture, so defer it and feed it reporting_time + the true cycle wall.
+        rep_start = time.time()
+        timing_reporters = []
         for reporter in self.reporters:
+            if getattr(reporter, "consumes_cycle_timing", False):
+                timing_reporters.append(reporter)
+                continue
+            reporter.report(**report)
+        report["cycle_reporting_time"] = time.time() - rep_start
+        report["cycle_true_wall"] = time.time() - cycle_start
+        for reporter in timing_reporters:
             reporter.report(**report)
 
         # prepare resampled walkers for running new state changes

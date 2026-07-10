@@ -13,13 +13,19 @@ only attached when ``profile: true``, so production runs are unaffected.
 """
 import csv
 import os.path as osp
+import time
 
 from wepy.reporter.reporter import Reporter
 
 FIELDNAMES = [
     "cycle_idx",
+    "wall_time",         # epoch time at cycle end -- join with gpu_util.csv to get GPU util vs N
+    "n_walkers",         # walker population this cycle (track growth to steady state / max)
     "n_segment_steps",
-    "cycle_wall",        # runner + bc + resampling (accounted wall time)
+    "true_cycle_wall",   # TRUE end-to-end cycle wall (incl. reporting/DCD) -- trust this
+    "cycle_wall",        # accounted = runner + bc + resampling (undercount; legacy)
+    "reporting_time",    # reporter I/O phase (HDF5/pkl/dashboard/DCD)
+    "unaccounted",       # true_cycle_wall - (cycle_wall + reporting_time); should be ~0
     "runner_time",       # segment/propagation phase wall time
     "bc_time",           # boundary conditions / warp
     "resampling_time",   # resampler.resample total
@@ -29,7 +35,8 @@ FIELDNAMES = [
     "mapper_overhead",   # runner_time - worker_busy_max (fork/serialize/queue)
     "images_time",       # resampler: per-walker projection of current state
     "distmat_time",      # resampler: O(N^2) pairwise distance matrix
-    "intensity_time",    # resampler: CV history update + changepoint + intensity
+    "cv_update_time",    # resampler: CV-history update incl. FULL DCD reload (A2 target)
+    "intensity_time",    # resampler: changepoint (P3b) + intensity/binning
 ]
 
 
@@ -50,7 +57,14 @@ def _worker_seg_stats(worker_segment_times):
 
 
 class TimingReporter(Reporter):
-    """Writes a per-cycle wall-clock breakdown to ``<save_path>``."""
+    """Writes a per-cycle wall-clock breakdown to ``<save_path>``.
+
+    Marked ``consumes_cycle_timing`` so the sim manager runs it LAST and feeds it
+    the reporting-phase time + the true end-to-end cycle wall (which are only known
+    after every other reporter has run).
+    """
+
+    consumes_cycle_timing = True
 
     def __init__(self, save_path="profile.csv"):
         self.save_path = save_path
@@ -73,16 +87,31 @@ class TimingReporter(Reporter):
         runner_time = float(kwargs.get("cycle_runner_time", 0.0) or 0.0)
         bc_time = float(kwargs.get("cycle_bc_time", 0.0) or 0.0)
         resampling_time = float(kwargs.get("cycle_resampling_time", 0.0) or 0.0)
+        reporting_time = float(kwargs.get("cycle_reporting_time", 0.0) or 0.0)
+        true_wall = float(kwargs.get("cycle_true_wall", 0.0) or 0.0)
 
         seg_sum, seg_max, worker_busy_max = _worker_seg_stats(
             kwargs.get("worker_segment_times"))
 
         sub = getattr(self.resampler, "_last_subtimings", {}) or {}
 
+        # walker population this cycle (CoWERA conserves N via balanced clone/merge,
+        # but track it to confirm steady state and catch warp/recycle effects).
+        walkers = (kwargs.get("resampled_walkers") or kwargs.get("new_walkers") or [])
+        n_walkers = len(walkers)
+
+        accounted = runner_time + bc_time + resampling_time
         row = {
             "cycle_idx": cycle_idx,
+            "wall_time": time.time(),          # cycle-end epoch; aligns with gpu_util.csv
+            "n_walkers": n_walkers,
             "n_segment_steps": kwargs.get("n_segment_steps"),
-            "cycle_wall": runner_time + bc_time + resampling_time,
+            "true_cycle_wall": true_wall,
+            "cycle_wall": accounted,
+            "reporting_time": reporting_time,
+            # residual the two timers don't explain (loop overhead, monitor, etc.);
+            # should be small once reporting is captured.
+            "unaccounted": max(0.0, true_wall - accounted - reporting_time),
             "runner_time": runner_time,
             "bc_time": bc_time,
             "resampling_time": resampling_time,
@@ -92,6 +121,7 @@ class TimingReporter(Reporter):
             "mapper_overhead": max(0.0, runner_time - worker_busy_max),
             "images_time": sub.get("images_time"),
             "distmat_time": sub.get("distmat_time"),
+            "cv_update_time": sub.get("cv_update_time"),
             "intensity_time": sub.get("intensity_time"),
         }
         self._writer.writerow(row)
