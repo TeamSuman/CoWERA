@@ -388,23 +388,34 @@ class CoWERAResampler(CloneMergeResampler):
 
     def get_dist(self, walkers, folder, n_d, it, n_bins, max_bins):
 
-        # Per-walker projection (image) onto the progress coordinate.
+        # Per-walker projection (image) onto the progress coordinate. Project each
+        # walker's state ONCE and reuse it for both the images and the euclidean
+        # distance matrix below (the old path re-projected each state ~2(N-1) times
+        # inside image_distance -- ~N^2 expensive RMSD/Q evals per cycle).
         _t0 = time.perf_counter()
-        images = [self.distance.get_proj_coord(walker.state)[0] for walker in walkers]
+        projections = [self.distance.get_proj_coord(walker.state) for walker in walkers]
+        images = [p[0] for p in projections]
         _t1 = time.perf_counter()
 
-        # Full symmetric pairwise distance matrix, computed in a single
-        # vectorized pass that reuses one cached topology/backbone selection
-        # (previously this constructed two MDAnalysis Universes for *every*
-        # walker pair, every cycle).
-        dist_mat = self.distance.pairwise_distance_matrix(walkers)
+        # Full symmetric pairwise distance matrix. For the euclidean criterion this
+        # reuses the projections above (O(N^2) scalar arithmetic, numerically
+        # identical); for pairwise_rmsd it does the real-space RMSD with one cached
+        # backbone selection.
+        dist_mat = self.distance.pairwise_distance_matrix(walkers, projections=projections)
         _t2 = time.perf_counter()
 
         # Per-walker intensities + adaptive bin count.
+        _t2b = _t2
         if self.use_cv_history:
             # Disk-free analysis: consume the in-memory accumulated histories.
+            # NB: _update_cv_histories still md.load()s each walker's FULL DCD every
+            # cycle (only the projection of new frames is incremental) -> O(T) I/O
+            # that GROWS with the run. Timed separately as cv_update_time so it is
+            # not conflated with the changepoint (this is the A2 runner-inline-CV
+            # target, which the P3b demo showed dominates the old 'intensity' bucket).
             dranges = self._update_cv_histories(walkers, folder, n_d)
             projections = self._cv_history.as_list()
+            _t2b = time.perf_counter()
             dl, n_bins = self.distance.intensity_from_projections(
                 projections, dranges, n_d=n_d, it=it,
                 n_bins=n_bins, max_bins=max_bins,
@@ -424,7 +435,8 @@ class CoWERAResampler(CloneMergeResampler):
         self._last_subtimings = {
             'images_time': _t1 - _t0,       # per-walker projection of current state
             'distmat_time': _t2 - _t1,      # O(N^2) pairwise distance matrix
-            'intensity_time': _t3 - _t2,    # CV history update + changepoint + intensity
+            'cv_update_time': _t2b - _t2,   # CV-history update incl. FULL DCD reload (A2 target)
+            'intensity_time': _t3 - _t2b,   # changepoint (P3b) + intensity/binning
         }
 
         return dl, [row for row in dist_mat], images, n_bins
