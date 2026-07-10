@@ -721,9 +721,14 @@ class WorkerMapper(ABCWorkerMapper):
                     raise exception
 
 
-            # attempt to get something off of the results queue
+            # attempt to get something off of the results queue. BLOCK briefly
+            # instead of get_nowait(): this parent loop otherwise spins at 100%
+            # CPU (and hammers the Manager-queue proxies) for the whole
+            # propagation phase. A short timeout yields the core to the workers'
+            # own CPU-side work (setState/getState/DCD) while still returning the
+            # instant a result is ready; the exception queue is polled each pass.
             try:
-                result = self._result_queue.get_nowait()
+                result = self._result_queue.get(block=True, timeout=0.05)
             except pyq.Empty:
                 pass
 
@@ -739,11 +744,14 @@ class WorkerMapper(ABCWorkerMapper):
         # sort the results according to their task_idx
         results.sort()
 
-        # save the task run times, so they can be accessed if desired,
-        # after clearing the task times from the last mapping
-
-        # DEBUG: removing this because it should be set on init()
-        #self._worker_segment_times = {i : [] for i in range(self.num_workers)}
+        # Reset to THIS cycle's segment times only. Persistent workers live across
+        # cycles, so without this reset _worker_segment_times accumulates every
+        # cycle's times forever; the dashboard reporter then loops over the whole
+        # history each cycle -> O(T^2) reporting blowup (reporting grew ~483 ms ->
+        # ~11 s over 158 cycles, making persistent workers degrade badly). The fork
+        # TaskMapper rebuilds this fresh per cycle, which is why it was unaffected.
+        # (Diagnostic/timing only -- no effect on walker states or the science.)
+        self._worker_segment_times = {i: [] for i in range(self.num_workers)}
 
         for task_idx, worker_idx, task_time, result in results:
             self._worker_segment_times[worker_idx].append(task_time)
@@ -993,9 +1001,15 @@ class Worker(mp.Process):
                             "Message: {} not recognized continuing operations".format(
                                 message)))
 
-            # get the next task
+            # get the next task. BLOCK (with a short timeout) rather than
+            # busy-poll: a non-blocking get() in this `while True` loop spins a
+            # worker at 100% CPU whenever the queue is empty -- i.e. all through
+            # the parent's resampling phase -- and hammers the Manager-queue
+            # proxy with IPC. With persistent workers (reuse_context) that starves
+            # the parent's CPU-bound resampling/distance-matrix node-wide (~6-7x).
+            # The timeout still lets us poll the interrupt channel ~5x/s.
             try:
-                 task_idx, next_task = self._task_queue.get(block=False, timeout=None)
+                 task_idx, next_task = self._task_queue.get(block=True, timeout=0.2)
 
                  logging.debug("{}: Got task {}".format(self.name, task_idx))
 
