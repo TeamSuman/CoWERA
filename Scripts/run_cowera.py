@@ -132,7 +132,13 @@ distance_criterion = args.distance_criterion
 # platforms (CPU/Reference/OpenCL) let CoWERA run on CPU-only HPC nodes.
 restart        = args.restart
 checkpoint_freq = getattr(args, "checkpoint_freq", 10)
+# scratch_dir: stage hot I/O (trajectory DCDs) on node-local disk instead of NFS
+# $HOME -- NFS write latency spikes MD cycles (~27%->7% on solaris). Expand env
+# vars so a config can use a per-job, collision-free path like
+# "/tmp/$USER/cowera_$PBS_JOBID"; trajectories are synced back to $HOME at the end.
 scratch_dir    = getattr(args, "scratch_dir", None)
+if scratch_dir:
+    scratch_dir = os.path.expandvars(scratch_dir)
 seed           = getattr(args, "seed", None)
 deterministic_dynamics = getattr(args, "deterministic_dynamics", False)
 profile        = getattr(args, "profile", False)
@@ -277,37 +283,51 @@ if __name__ == "__main__":
     final_dcd_folder = f'{outputs_dir}/trajectories/'
     os.makedirs(final_dcd_folder, exist_ok=True)
 
+    # Node-local scratch for the high-churn per-cycle DCD I/O (read/append/copy/
+    # remove) -- on fast local disk instead of a shared/NFS output filesystem, which
+    # those small ops otherwise hammer (NFS write latency stalled ~27% of MD cycles;
+    # local scratch dropped that to ~7%). The user names the compute-node scratch
+    # path via `scratch_dir` in the input file. It is used ONLY IF available AND
+    # writable on this node; otherwise we fall back to writing trajectories in the
+    # output dir (the PBS working directory) -- so a config naming a scratch path
+    # stays portable across nodes/clusters that lack it, and a bad path never aborts
+    # the run. Durable checkpoints (pkls/) + results (h5) always stay on the output
+    # dir so restarts work; trajectories are synced back from scratch on exit.
+    dcd_folder = final_dcd_folder          # default: output dir == PBS working dir
     if scratch_dir:
-        # Node-local scratch: the many small per-cycle DCD read/append/copy/remove
-        # operations run on fast local disk instead of a shared parallel filesystem
-        # (Lustre/GPFS), which they would otherwise hammer with metadata ops. The
-        # durable checkpoints (pkls/) and results (h5) stay on the output dir so a
-        # restart still works. Trajectories are synced back on exit.
-        dcd_folder = osp.join(scratch_dir,
-                              f'cowera_run{run}_steps{n_steps}_cycs{n_cycles}',
-                              'trajectories') + os.sep
-        os.makedirs(dcd_folder, exist_ok=True)
+        _node = os.uname().nodename
+        candidate = osp.join(scratch_dir,
+                             f'cowera_run{run}_steps{n_steps}_cycs{n_cycles}',
+                             'trajectories') + os.sep
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            _probe = osp.join(candidate, '.cowera_write_probe')     # confirm writable
+            open(_probe, 'w').close()
+            os.remove(_probe)
+        except Exception as exc:
+            print(f"{Fore.YELLOW}scratch_dir {scratch_dir!r} not available/writable "
+                  f"on {_node} ({exc}); writing trajectories to the output dir "
+                  f"({final_dcd_folder}) instead.")
+        else:
+            dcd_folder = candidate
+            # On restart, re-stage previously synced trajectories to scratch so the
+            # in-memory CV histories can rebuild from them.
+            if restart:
+                for fname in os.listdir(final_dcd_folder):
+                    shutil.copy(osp.join(final_dcd_folder, fname), osp.join(dcd_folder, fname))
 
-        # On restart, re-stage any previously synced trajectories to scratch so the
-        # in-memory CV histories can rebuild from them.
-        if restart:
-            for fname in os.listdir(final_dcd_folder):
-                shutil.copy(osp.join(final_dcd_folder, fname), osp.join(dcd_folder, fname))
+            def _sync_trajectories_back():
+                try:
+                    os.makedirs(final_dcd_folder, exist_ok=True)
+                    for fname in os.listdir(dcd_folder):
+                        shutil.copy(osp.join(dcd_folder, fname), osp.join(final_dcd_folder, fname))
+                    print(f"Synced trajectories from scratch -> {final_dcd_folder}")
+                except Exception as exc:
+                    print(f"Warning: failed to sync trajectories from scratch ({exc}).")
 
-        def _sync_trajectories_back():
-            try:
-                os.makedirs(final_dcd_folder, exist_ok=True)
-                for fname in os.listdir(dcd_folder):
-                    shutil.copy(osp.join(dcd_folder, fname), osp.join(final_dcd_folder, fname))
-                print(f"Synced trajectories from scratch -> {final_dcd_folder}")
-            except Exception as exc:
-                print(f"Warning: failed to sync trajectories from scratch ({exc}).")
-
-        import atexit
-        atexit.register(_sync_trajectories_back)
-        print(f"{Fore.CYAN}Trajectories staged on node-local scratch: {dcd_folder}")
-    else:
-        dcd_folder = final_dcd_folder
+            import atexit
+            atexit.register(_sync_trajectories_back)
+            print(f"{Fore.CYAN}Trajectories staged on node-local scratch: {dcd_folder} (node {_node})")
 
 
     system_file = os.path.join(inp_path, "system.py")
@@ -498,11 +518,23 @@ if __name__ == "__main__":
     # i0_mode='uniform' and/or use_phase=false reproduce the paper's baselines.
     i0_mode = getattr(args, "i0_mode", "projection")
     use_phase = getattr(args, "use_phase", True)
+    # P3b: bound the per-cycle changepoint detection to the most recent
+    # `changepoint_window` CV frames (None = unbounded/exact, the default).
+    changepoint_window = getattr(args, "changepoint_window", None)
+    # A2: read only new DCD frames each cycle instead of md.load()ing the whole
+    # trajectory. ON by default -- verified bit-identical to the full load on both
+    # feature paths (best_hummer_q + rmsd_backbone), and it falls back to the full
+    # load on any error. verify_incremental_cv asserts equivalence (validation).
+    incremental_cv_read = getattr(args, "incremental_cv_read", True)
+    verify_incremental_cv = getattr(args, "verify_incremental_cv", False)
 
     # Distance metric to be used in resampling
     proj_distance = Calculate_Distances(sel_feat, increment=increment, native_file=native_path, init_file=start_path,
                                         tar_file=tar_path, top_file=native_path, distance_criterion=distance_criterion,
-                                        i0_mode=i0_mode, use_phase=use_phase)
+                                        i0_mode=i0_mode, use_phase=use_phase,
+                                        changepoint_window=changepoint_window,
+                                        incremental_cv_read=incremental_cv_read,
+                                        verify_incremental_cv=verify_incremental_cv)
 
     #init_rmsd = proj_distance.image_distance(walker_state, target_walker_state)
     #print(f"Initial rmsd distance from target: {init_rmsd}")

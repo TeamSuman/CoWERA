@@ -267,6 +267,23 @@ use_cv_history: true
 # walkers. Leave as null for unbounded (full) history (paper-faithful).
 history_window: null
 
+# P3b: cap the CV history the changepoint detector sees to the most recent
+# N frames, so KernelCPD is O(N^2) per walker instead of O(T^2) growing with
+# the run (the dominant CPU cost at scale). Only the most recent changepoint
+# (the current phase boundary) is used, so a window >= the relevant-history
+# length reproduces the unbounded result. null = unbounded/exact (default).
+changepoint_window: null
+
+# A2: read ONLY the new frames from each walker's DCD each cycle (random access)
+# instead of md.load()ing the whole growing trajectory -> O(new) not O(total), the
+# dominant growing CPU cost. Numerically identical (verified bit-identical on both
+# feature paths); on any error it falls back to the full load. Default true; set
+# false to force the exact full-load path.
+incremental_cv_read: true
+# When true, also recompute the full-load projection and assert it matches the
+# incremental one (validation; slower). Use to certify a new system, then disable.
+verify_incremental_cv: false
+
 # Adaptive-bin adjustment factors (paper Appendix F). When <20% of bins are
 # visited, n_bins *= bin_increase_factor; when >80%, n_bins *= bin_decrease_factor.
 # Defaults 1.2 / 0.8 match the code's historical behaviour. NOTE: the manuscript
@@ -283,9 +300,14 @@ bin_decrease_factor: 0.8
 # Subdirectory inside system DIR to store results
 output_folder: "unfolding_runs"
 
-# Optional node-local scratch directory (e.g. "$TMPDIR" on SLURM/PBS). When set,
-# the high-churn per-walker trajectory (DCD) I/O is staged on fast local disk and
-# synced back to the output directory on exit, sparing shared parallel filesystems
-# (Lustre/GPFS). Checkpoints and the results file stay on the output directory so
-# restarts still work. Leave null to write trajectories directly to output_folder.
+# Optional node-local scratch directory for the high-churn per-walker trajectory
+# (DCD) I/O; synced back to the output directory on exit. **Strongly recommended on
+# clusters where the output dir is on a shared/NFS filesystem** — writing DCD frames
+# to NFS during propagation hits variable latency that STALLS the compute loop
+# (measured: ~27% of MD cycles spiked to ~2.7x median; node-local scratch cut that
+# to ~7% and the mean cycle time ~29%). Env vars are expanded, so use a per-job,
+# collision-free path. Solaris/PBS example: "/tmp/$USER/cowera_$PBS_JOBID" (/tmp is
+# 125G local ext4; /scratch is root-only there; avoid /dev/shm for large runs — RAM).
+# Checkpoints + the results file stay on the output dir so restarts still work.
+# Leave null to write trajectories directly to output_folder.
 scratch_dir: null

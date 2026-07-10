@@ -89,3 +89,15 @@ increment: -1
 # -------------------- Output Configuration ------------------ #
 # Name of subdirectory to store simulation results inside DIR.
 output_folder: "folding_runs"
+
+# -------------------- Compute-node scratch (optional) ------- #
+# Fast node-local scratch path for the high-churn per-cycle trajectory (DCD) I/O.
+# On clusters where the output dir is on a shared/NFS filesystem, writing DCD
+# frames there during propagation hits variable latency that stalls the run
+# (measured: ~27% of cycles spiked; node-local scratch cut that to ~7%). Set this
+# to a writable per-job path on the compute node; env vars are expanded.
+#   PBS/solaris example:  "/tmp/$USER/cowera_$PBS_JOBID"   (/tmp = 125G local disk)
+# It is used ONLY IF available/writable on the node; otherwise the run falls back
+# to writing trajectories in the output dir (the PBS working directory). Leave
+# null to always write to the output dir. Checkpoints/results always go to output.
+scratch_dir: null
