@@ -519,14 +519,28 @@ if __name__ == "__main__":
     i0_mode = getattr(args, "i0_mode", "projection")
     use_phase = getattr(args, "use_phase", True)
     # P3b: bound the per-cycle changepoint detection to the most recent
-    # `changepoint_window` CV frames (None = unbounded/exact, the default).
-    changepoint_window = getattr(args, "changepoint_window", None)
+    # `changepoint_window` CV frames. DEFAULT 1000 (was None/unbounded): with an
+    # unbounded window KernelCPD re-scans the whole growing CV history every cycle,
+    # which is O(T^2) -- measured growing from 0.1 s to 4.6 s/cycle over 1500 cycles
+    # and dragging the cycle from 3 s to 8.6 s. The windowed detector is
+    # exact-by-construction (it expands until the last changepoint is stable across a
+    # doubling, up to the full history), and a paired same-seed run confirmed it is
+    # rate-identical: 0.6563 vs 0.6651 x1e7 s^-1 (~1.3%) at ~4.6x lower cost.
+    # Set explicitly to null to restore the unbounded scan.
+    changepoint_window = getattr(args, "changepoint_window", 1000)
     # A2: read only new DCD frames each cycle instead of md.load()ing the whole
     # trajectory. ON by default -- verified bit-identical to the full load on both
     # feature paths (best_hummer_q + rmsd_backbone), and it falls back to the full
     # load on any error. verify_incremental_cv asserts equivalence (validation).
     incremental_cv_read = getattr(args, "incremental_cv_read", True)
     verify_incremental_cv = getattr(args, "verify_incremental_cv", False)
+    # D-2: paper (Appendix B) specifies PELT; the code historically hardcoded
+    # KernelCPD + an undocumented penalty 0.01. Both now selectable.
+    changepoint_algo = getattr(args, "changepoint_algo", "kernelcpd")
+    changepoint_penalty = getattr(args, "changepoint_penalty", 0.01)
+    # Phase-window guard: "published" reproduces the released code / manuscript
+    # numbers; "strict" avoids the negative-index wraparound but shortens the window.
+    relevant_history_mode = getattr(args, "relevant_history_mode", "published")
 
     # Distance metric to be used in resampling
     proj_distance = Calculate_Distances(sel_feat, increment=increment, native_file=native_path, init_file=start_path,
@@ -534,7 +548,10 @@ if __name__ == "__main__":
                                         i0_mode=i0_mode, use_phase=use_phase,
                                         changepoint_window=changepoint_window,
                                         incremental_cv_read=incremental_cv_read,
-                                        verify_incremental_cv=verify_incremental_cv)
+                                        verify_incremental_cv=verify_incremental_cv,
+                                        changepoint_algo=changepoint_algo,
+                                        changepoint_penalty=changepoint_penalty,
+                                        relevant_history_mode=relevant_history_mode)
 
     #init_rmsd = proj_distance.image_distance(walker_state, target_walker_state)
     #print(f"Initial rmsd distance from target: {init_rmsd}")
@@ -565,6 +582,15 @@ if __name__ == "__main__":
     # states 1.5 / 0.75 -- set these explicitly to reproduce the paper text.
     bin_increase_factor = getattr(args, "bin_increase_factor", 1.2)
     bin_decrease_factor = getattr(args, "bin_decrease_factor", 0.8)
+    # Which eligible walker (within D_merge) a squashed walker is merged INTO.
+    # Which eligible walker (within D_merge) a squashed walker is merged INTO.
+    # DEFAULT "random": what the released code used (hence the published numbers), and
+    # it preserves ensemble diversity. "closest" matches Appendix D's "nearby" wording
+    # and gives much better statistics where it works (Trp-cage paired: warps 89->222
+    # and 4->127, ESS 23->53 and 2.8->34, steady-state CV 99.6%->6.7%), BUT on 1 of 3
+    # Trp-cage seeds it stalled short of the target and produced ZERO reactive events
+    # (min dist 0.3493 vs 0.30 cutoff) where random-merge got 70. Opt-in only.
+    merge_partner = getattr(args, "merge_partner", "closest")
 
     # Set up the Resampler with the parameters
     resampler = CoWERAResampler(distance=proj_distance,
@@ -581,7 +607,8 @@ if __name__ == "__main__":
                               use_cv_history=use_cv_history,
                               history_window=history_window,
                               bin_increase_factor=bin_increase_factor,
-                              bin_decrease_factor=bin_decrease_factor)
+                              bin_decrease_factor=bin_decrease_factor,
+                              merge_partner=merge_partner)
 
     # Set up the boundary conditions for a non-eq ensemble
     tbc = TargetBC(cutoff_distance=d_warped,
@@ -627,11 +654,19 @@ if __name__ == "__main__":
                                       num_backups = 2,
                                       wipe_on_init = not restart)
 
-    # Set up the dashboard reporter
-    dashboard_path = osp.join(outputs_dir,f'wepy.dash.org')
-    openmm_dashboard_sec = OpenMMRunnerDashboardSection(runner)
-    dashboard_reporter = DashboardReporter(file_path = dashboard_path,
-                                        runner_dash = openmm_dashboard_sec)
+    # Set up the dashboard reporter (live wepy.dash.org). NB: it appends per-cycle
+    # stats to growing lists and recomputes running means over the FULL history every
+    # cycle -> O(T) reporting cost that grows without bound on long runs (measured:
+    # reporting 0.18 s -> 2.2 s over 2700 cycles). It is a live-monitoring aid only --
+    # the HDF5 results + profile.csv hold all the data -- so it can be turned off for
+    # long production runs via `dashboard: false` (default on for interactive use).
+    enable_dashboard = getattr(args, "dashboard", True)
+    dashboard_reporter = None
+    if enable_dashboard:
+        dashboard_path = osp.join(outputs_dir,f'wepy.dash.org')
+        openmm_dashboard_sec = OpenMMRunnerDashboardSection(runner)
+        dashboard_reporter = DashboardReporter(file_path = dashboard_path,
+                                            runner_dash = openmm_dashboard_sec)
 
 
     # Create a work mapper. GPU platforms (CUDA/OpenCL) assign a device per worker
@@ -662,7 +697,9 @@ if __name__ == "__main__":
 
 
     # Assemble reporters; add the per-cycle timing profiler when profile: true.
-    reporters = [hdf5_reporter, pkl_reporter, dashboard_reporter]
+    reporters = [hdf5_reporter, pkl_reporter]
+    if dashboard_reporter is not None:
+        reporters.append(dashboard_reporter)
     if profile:
         reporters.append(TimingReporter(save_path=osp.join(outputs_dir, 'profile.csv')))
         print(f"{Fore.CYAN}Profiling enabled -> {osp.join(outputs_dir, 'profile.csv')}")

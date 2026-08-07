@@ -57,6 +57,7 @@ class CoWERAResampler(CloneMergeResampler):
                  history_window = None,
                  bin_increase_factor = 1.2,
                  bin_decrease_factor = 0.8,
+                 merge_partner = "random",
                  **kwargs):
 
         """Constructor for the REVO Resampler.
@@ -147,6 +148,26 @@ class CoWERAResampler(CloneMergeResampler):
         # so they can be set from config; forwarded to both analysis paths.
         self.bin_increase_factor = bin_increase_factor
         self.bin_decrease_factor = bin_decrease_factor
+        # Which eligible walker (within D_merge of the squashed walker) to merge INTO.
+        # This is an EXPLORATION-vs-EFFICIENCY trade-off; measured both ways.
+        #
+        # "random" (DEFAULT) = uniformly random eligible walker. This is what the
+        #     released code (github.com/Shaheerah3007/CoWERA-1) used, so it is what
+        #     produced the published numbers, and it preserves ensemble diversity.
+        #
+        # "closest" = the NEAREST eligible walker, matching Appendix D's "nearby"
+        #     wording. Much better STATISTICS where it works -- paired same-seed runs:
+        #       chignolin  (n=3): +30% warps (41->54), worst Kish ESS 3.7->10.0
+        #       Trp-cage   (n=3): warps 89->222 and 4->127; ESS 23.0->52.8, 2.8->33.6;
+        #                         top1 0.43->0.05; steady-state CV 99.6%->6.7%
+        #     BUT it has a real FAILURE MODE: always merging into the nearest walker
+        #     erodes ensemble diversity, and on 1 of 3 Trp-cage seeds the ensemble
+        #     stalled short of the target and produced ZERO reactive events in 800
+        #     cycles (min distance 0.3493 vs a 0.30 cutoff), where the paired
+        #     random-merge run reached 0.2545 and got 70 warps. Weight conservation
+        #     was exact in both, so this is a sampling failure, not a bug.
+        #     => opt-in only, and monitor min-distance-to-target when using it.
+        self.merge_partner = merge_partner
 
         # Most recent adaptive bin count returned by ``resample``. Snapshotted by
         # the pickle/checkpoint reporter so a restarted run resumes with the same
@@ -263,7 +284,13 @@ class CoWERAResampler(CloneMergeResampler):
 
                 eligible = candidates[merge_mask[min_idx, candidates]]
                 if len(eligible) > 0:
-                    closewalk = self._rng.choice(eligible)
+                    if self.merge_partner == "closest":
+                        # Paper Appendix D: merge into a *nearby* walker -> take the
+                        # NEAREST eligible one (all are already within D_merge).
+                        closewalk = int(eligible[np.argmin(distance_matrix[min_idx, eligible])])
+                    else:
+                        # Historical behaviour: uniformly random eligible walker.
+                        closewalk = self._rng.choice(eligible)
 
             #print(f"Max idx: {max_idx}, Max var: {walker_variations[max_idx] if max_idx is not None else 'N/A'}, Min idx: {min_idx}, Min var: {walker_variations[min_idx] if min_idx is not None else 'N/A'}, Close walk: {closewalk}, min dist : {distance_matrix[min_idx, closewalk] if closewalk is not None else 'N/A'}")
             if min_idx is not None and max_idx is not None and closewalk is not None:

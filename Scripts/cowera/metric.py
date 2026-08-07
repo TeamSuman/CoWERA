@@ -122,17 +122,37 @@ def compute_intensity(weights_scaled, phases_scaled, use_phase=True):
     return interference / imax
 
 
-def relevant_change_points(changes, n_d):
+def relevant_change_points(changes, n_d, mode="published"):
     """Build the segment boundaries used for the phase calculation (Appendix B).
 
-    ``changes`` are the changepoint indices returned by the detector. We keep a
-    short pre-transition buffer of ``n_d`` before the most recent changepoint
-    when that is well-defined, otherwise fall back to the raw changepoints.
+    ``changes`` are the changepoint indices returned by the detector. A short
+    pre-transition buffer of ``n_d`` frames is kept before the most recent
+    changepoint, so the phase is measured over the transition *plus* its run-up.
+
+    ``mode`` selects the guard on that buffer -- these are NOT equivalent, and the
+    choice changes the phase window, hence the resampling:
+
+    "published" (DEFAULT) -- reproduces the released CoWERA code and therefore the
+        manuscript numbers. The guard is ``np.all(changes[:-1] - n_d) > 0``, which
+        evaluates as ``(all elements nonzero) > 0`` and is therefore True unless an
+        interior changepoint lands exactly on ``n_d``: the buffer is applied almost
+        always. NB this can make ``changes[-2] - n_d`` NEGATIVE, which numpy slicing
+        silently reads as "the last |x| frames" -- a quirk of the original, retained
+        here deliberately so results remain comparable to the published values.
+
+    "strict" -- applies the buffer only when every interior changepoint exceeds
+        ``n_d`` (``np.all((changes[:-1] - n_d) > 0)``), avoiding the negative-index
+        wraparound. This is the arguably-intended reading, but it yields a SHORTER
+        phase window whenever an interior changepoint <= n_d (common right after a
+        warp reset, when the history is short), so it is a real behavioural change
+        and must not be used for reproduction work.
     """
     changes = np.asarray(changes)
-    # NOTE: precedence fix -- the intent is "all interior changepoints, shifted
-    # back by n_d, are still positive", i.e. np.all((changes[:-1] - n_d) > 0).
-    if changes.size >= 1 and np.all((changes[:-1] - n_d) > 0):
+    if mode == "strict":
+        keep = changes.size >= 1 and np.all((changes[:-1] - n_d) > 0)
+    else:
+        keep = np.all(changes[:-1] - n_d) > 0
+    if keep:
         return np.concatenate(([0], changes[:-1] - n_d, changes[-1:]))
     return np.concatenate(([0], changes))
 
@@ -145,7 +165,9 @@ class Calculate_Distances:
     def __init__(self, feat, increment, native_file=None, init_file=None, tar_file=None,
                  top_file=None, distance_criterion="pairwise_rmsd",
                  i0_mode="projection", use_phase=True, changepoint_window=None,
-                 incremental_cv_read=True, verify_incremental_cv=False):
+                 incremental_cv_read=True, verify_incremental_cv=False,
+                 changepoint_algo="kernelcpd", changepoint_penalty=0.01,
+                 relevant_history_mode="published"):
         super().__init__()
         self._feat = feat
         self.native_file = native_file
@@ -174,6 +196,23 @@ class Calculate_Distances:
         self.incremental_cv_read = incremental_cv_read
         self.verify_incremental_cv = verify_incremental_cv
         self._md_top = None                 # cached mdtraj topology (lazily built)
+
+        # D-2 (docs/MANUSCRIPT_CONSISTENCY.md): the manuscript (Appendix B) specifies
+        # PELT with a linear kernel; the code historically hardcoded a *different*
+        # search, KernelCPD(kernel="linear"), with an *undocumented* penalty 0.01.
+        # Both are now selectable so the published setup can be reproduced/compared.
+        #   "kernelcpd" -> ruptures.KernelCPD(kernel="linear")   [historical default]
+        #   "pelt"      -> ruptures.Pelt(model="l2")             [paper Appendix B]
+        # (KernelCPD's linear kernel and PELT's l2 cost are the same cost; the
+        # difference is the search algorithm.) The penalty stays undocumented in the
+        # paper -- keep it configurable rather than silently baked in.
+        self.changepoint_algo = changepoint_algo
+        self.changepoint_penalty = changepoint_penalty
+        # Which guard to use for the n_d pre-transition buffer in the phase window.
+        # "published" reproduces the released code (and the manuscript numbers);
+        # "strict" is the arguably-intended reading but shortens the window whenever
+        # an interior changepoint <= n_d. See relevant_change_points().
+        self.relevant_history_mode = relevant_history_mode
 
         # Cache for the MDAnalysis reference topology used by the pairwise-RMSD
         # criterion, built once and reused (previously two Universes were
@@ -457,21 +496,30 @@ class Calculate_Distances:
                 return ref
         return result
 
-    @staticmethod
-    def _detect_changes(projection):
-        """KernelCPD changepoint indices for ``projection`` (always ends with its
-        length). Guards short/failing signals: KernelCPD(min_size=2) needs
-        >= 2*min_size samples or raises BadSegmentationParameters (which would crash
-        the first cycles of a run with few frames/segment); on a too-short signal or
-        any detector failure, degrade to a single segment (the whole history)."""
+    def _detect_changes(self, projection):
+        """Changepoint indices for ``projection`` (always ends with its length).
+
+        ``changepoint_algo`` picks the ruptures search (see __init__ / D-2):
+          "kernelcpd" -> KernelCPD(kernel="linear")  [historical default]
+          "pelt"      -> Pelt(model="l2")            [paper Appendix B]
+        both at ``changepoint_penalty`` (default 0.01, undocumented in the paper).
+
+        Guards short/failing signals: min_size=2 needs >= 2*min_size samples or
+        ruptures raises BadSegmentationParameters (which would crash the first cycles
+        of a run with few frames/segment); on a too-short signal or any detector
+        failure, degrade to a single segment (the whole history).
+        """
         _MIN_SIZE = 2
         n = len(projection)
         if n < 2 * _MIN_SIZE:
             return np.array([n])
         try:
             import ruptures as rpt
-            algo = rpt.KernelCPD(kernel="linear", min_size=_MIN_SIZE).fit(projection)
-            return np.array(algo.predict(pen=0.01))
+            if self.changepoint_algo == "pelt":
+                algo = rpt.Pelt(model="l2", min_size=_MIN_SIZE).fit(projection)
+            else:
+                algo = rpt.KernelCPD(kernel="linear", min_size=_MIN_SIZE).fit(projection)
+            return np.array(algo.predict(pen=self.changepoint_penalty))
         except Exception:
             return np.array([n])
 
@@ -519,7 +567,8 @@ class Calculate_Distances:
                 prev_seg = seg
                 W = min(W * 2, T)
 
-        change_points = relevant_change_points(changes, n_d)
+        change_points = relevant_change_points(changes, n_d,
+                                               mode=self.relevant_history_mode)
 
         weight = projection[-1]
 

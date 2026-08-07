@@ -100,7 +100,9 @@ def test_adaptive_changepoint_window_finds_stable_last_changepoint(monkeypatch):
         cp = n - 40                       # 40 frames from the end
         return np.array([cp, n]) if cp >= 2 else np.array([n])
     cd = Calculate_Distances(feat="best_hummer_q", increment=1, changepoint_window=8)
-    monkeypatch.setattr(cd, "_detect_changes", staticmethod(fake_detect))
+    # NB bind directly (no staticmethod wrapper): _detect_changes is an instance
+    # method now that it dispatches on self.changepoint_algo (kernelcpd vs pelt).
+    monkeypatch.setattr(cd, "_detect_changes", fake_detect)
     proj = np.linspace(0.2, 0.8, 500)
     drange = np.array([0.2, 0.8])
     bins, phase, weight = cd.phase_from_projection(proj, drange, n_d=5, n_bins=122)
@@ -256,13 +258,29 @@ def test_relevant_change_points_single_changepoint():
     assert list(out) == [0, 7]
 
 
-def test_relevant_change_points_precedence_fix():
-    """Demonstrates the operator-precedence bug fix.
+def test_relevant_change_points_modes():
+    """The two phase-window guards are NOT equivalent -- pin both deliberately.
 
-    With changes=[1, 10] and n_d=5 the interior changepoint shifted back by n_d
-    is negative, so the fallback (no buffer) branch must be taken. The old code
-    ``np.all(changes[:-1] - n_d) > 0`` evaluated ``np.all(...)`` to a bool first
-    and compared that to 0, taking the wrong branch.
+    ``np.all(changes[:-1] - n_d) > 0`` (the released code, "published") evaluates
+    ``np.all(...)`` to a bool first and compares that to 0, so it is True unless an
+    interior changepoint equals n_d exactly: the n_d pre-transition buffer is applied
+    almost always, and the start index may go NEGATIVE (numpy then reads it as "the
+    last |x| frames"). ``np.all((changes[:-1] - n_d) > 0)`` ("strict") is the
+    arguably-intended reading but drops the buffer whenever an interior changepoint
+    <= n_d, giving a SHORTER window.
+
+    This was originally "fixed" to strict, which silently changed the resampling.
+    "published" is the default because it reproduces the manuscript; keep both pinned
+    so the difference can never be reintroduced by accident.
     """
-    out = relevant_change_points(changes=[1, 10], n_d=5)
-    assert list(out) == [0, 1, 10]
+    # published (default) -- keeps the buffer, negative start index and all
+    assert list(relevant_change_points(changes=[1, 10], n_d=5)) == [0, -4, 10]
+    assert list(relevant_change_points(changes=[1, 10], n_d=5,
+                                       mode="published")) == [0, -4, 10]
+    # strict -- falls back to the raw changepoints (shorter window)
+    assert list(relevant_change_points(changes=[1, 10], n_d=5,
+                                       mode="strict")) == [0, 1, 10]
+    # where every interior changepoint exceeds n_d the two agree
+    for mode in ("published", "strict"):
+        assert list(relevant_change_points(changes=[20, 60, 120], n_d=10,
+                                           mode=mode)) == [0, 10, 50, 120]
