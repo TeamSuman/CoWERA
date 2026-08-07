@@ -59,8 +59,16 @@ CoWERA/
 │
 ├── Scripts/                  # CoWERA + Wepy workflow scripts
 │   ├── run_cowera.py         # Main execution script
-│   ├── config_template.yml   # Config template
-│   └── (other wepy/cowera utilities)
+│   ├── config_template.yml   # Fully documented configuration template
+│   ├── cowera/               # The CoWERA method (resampler, metric, features)
+│   ├── wepy/                 # Vendored Wepy weighted-ensemble engine
+│   ├── tools/                # Analysis + profiling utilities (see section 11)
+│   ├── tests/                # Unit tests (pure NumPy, no GPU/MD needed)
+│   ├── slurm/                # SLURM batch example
+│   └── sample_job_multirun.sh   # PBS batch example
+│
+├── docs/
+│   └── REPRODUCING_THE_PAPER.md    # Reproduce the published kinetics
 │
 ├── env/
 │   └── environment.yml
@@ -297,6 +305,70 @@ This file contains:
 - Walker weights  
 - Resampling history  
 - Full WE trajectory data  
+
+---
+
+---
+
+# 🧪 1️⃣1️⃣ Tests and Analysis Utilities
+
+## Running the tests
+
+The algorithm cores are unit-tested in pure NumPy and need **no GPU and no MD stack**:
+
+```bash
+python -m pytest Scripts/tests/ -q
+```
+
+Tests that require the full MD stack (OpenMM / mdtraj) are marked `integration` and
+are deselected by default. On a host with the environment installed:
+
+```bash
+python -m pytest Scripts/tests/ -m integration
+```
+
+## Analysis utilities (`Scripts/tools/`)
+
+| Tool | Purpose |
+|---|---|
+| `mfpt_running.py` | Running MFPT / rate vs simulated time from `wepy.results.h5` (Hill relation) |
+| `mfpt_estimators.py` | Compare rate estimators and report the **effective sample size (ESS)** |
+| `replica_stats.py` | Block-average independent replicas → mean rate + 95% confidence interval |
+| `make_replica_config.py` | Generate per-replica configs with distinct seed + run label |
+| `bench_run.py` | Per-cycle wall-clock breakdown (set `profile: true` in the config) |
+| `gpu_monitor.py` | Background GPU utilisation sampler |
+
+Example — running rate curve and a replica-averaged estimate:
+
+```bash
+python Scripts/tools/mfpt_running.py --h5 <output>/wepy.results.h5 --n-walkers 16 --n-steps 1000
+python Scripts/tools/replica_stats.py --n-walkers 16 --n-steps 1000 --h5 run*/wepy.results.h5
+```
+
+## 📏 Reporting a rate correctly
+
+Two points matter more than they might appear:
+
+1. **Divide by the total simulated time**, not by the time of the last recycling
+   event. Simulated time after the final event produced no flux but was still paid
+   for; excluding it inflates the rate.
+2. **Quote the ESS alongside the rate.** The flux is a *weighted* sum of rare
+   events, so a run with many recycling events can still have a small effective
+   sample size if a few high-weight walkers dominate. `mfpt_estimators.py` reports
+   both, and a rate carrying an ESS of only a few events should be treated as
+   preliminary.
+
+For statistically meaningful kinetics, run **several independent replicas**
+(different `seed` and `run` label) and block-average them with `replica_stats.py`
+rather than quoting a single run.
+
+---
+
+# 📖 Reproducing the published results
+
+See [`docs/REPRODUCING_THE_PAPER.md`](docs/REPRODUCING_THE_PAPER.md) for the
+parameter mapping (paper Table I → `config.yml`), ready-to-use configurations for
+chignolin and Trp-cage folding/unfolding, and the analysis procedure.
 
 ---
 

@@ -270,9 +270,15 @@ history_window: null
 # P3b: cap the CV history the changepoint detector sees to the most recent
 # N frames, so KernelCPD is O(N^2) per walker instead of O(T^2) growing with
 # the run (the dominant CPU cost at scale). Only the most recent changepoint
-# (the current phase boundary) is used, so a window >= the relevant-history
-# length reproduces the unbounded result. null = unbounded/exact (default).
-changepoint_window: null
+# (the current phase boundary) is used, and the window EXPANDS until that
+# changepoint is stable across a doubling (up to the full history), so this is
+# exact-by-construction rather than an approximation.
+# DEFAULT 1000 (was null/unbounded): with an unbounded window the detector rescans
+# the whole growing history every cycle -- measured growing 0.1 s -> 4.6 s/cycle over
+# 1500 cycles. A paired same-seed run confirmed the windowed result is rate-identical
+# (0.6563 vs 0.6651 x1e7 s^-1, ~1.3%) at ~4.6x lower cost.
+# Set to null to restore the unbounded scan.
+changepoint_window: 1000
 
 # A2: read ONLY the new frames from each walker's DCD each cycle (random access)
 # instead of md.load()ing the whole growing trajectory -> O(new) not O(total), the
@@ -290,6 +296,47 @@ verify_incremental_cv: false
 # text states 1.5 / 0.75 -- set these to reproduce the paper exactly (decision D-1).
 bin_increase_factor: 1.2
 bin_decrease_factor: 0.8
+
+# Which eligible walker (within d_merge) a squashed walker is merged INTO.
+# EXPLORATION vs EFFICIENCY trade-off -- measured both ways, paired by seed:
+#   "random" (DEFAULT) = uniformly random eligible walker. What the released code used
+#       (so it reproduces the published numbers) and it preserves ensemble diversity.
+#   "closest" = the NEAREST eligible walker (Appendix D's "nearby"). Much better
+#       statistics where it works: Trp-cage warps 89->222 and 4->127, Kish ESS 23->53
+#       and 2.8->34, top1 0.43->0.05, steady-state CV 99.6%->6.7%; chignolin +30% warps.
+#       FAILURE MODE: on 1 of 3 Trp-cage seeds the ensemble stalled short of the target
+#       and produced ZERO reactive events in 800 cycles (min dist 0.3493 vs 0.30
+#       cutoff) while the paired random run reached 0.2545 / 70 warps. Weight
+#       conservation was exact, so it is a sampling failure, not a bug.
+#       => opt-in only; monitor min-distance-to-target if you enable it.
+merge_partner: "random"
+
+# Changepoint search (paper Appendix B says PELT; the code historically hardcoded a
+# different search, KernelCPD, with an UNDOCUMENTED penalty of 0.01).
+#   "kernelcpd" -> ruptures.KernelCPD(kernel="linear")   [historical default]
+#   "pelt"      -> ruptures.Pelt(model="l2")             [paper Appendix B]
+# Same underlying cost (linear kernel == l2); the difference is the search algorithm.
+# Guard for the n_d pre-transition buffer in the phase window (Appendix B).
+#   "published" (DEFAULT) = reproduces the RELEASED CoWERA code, and therefore the
+#       manuscript numbers. Its guard `np.all(changes[:-1] - n_d) > 0` evaluates as
+#       "(all elements nonzero) > 0", so the buffer is applied almost always; the
+#       start index can go NEGATIVE, which numpy reads as "the last |x| frames".
+#       That quirk is part of the published behaviour and is retained deliberately.
+#   "strict" = apply the buffer only when every interior changepoint exceeds n_d.
+#       The arguably-intended reading, but it SHORTENS the phase window whenever an
+#       interior changepoint <= n_d (common just after a warp, when history is
+#       short). This is a real behavioural change -- do NOT use for reproduction.
+relevant_history_mode: "published"
+
+# Write the live wepy.dash.org dashboard. It appends per-cycle stats to growing
+# lists and recomputes running means over the FULL history every cycle, i.e. O(T)
+# per cycle that grows without bound (measured: reporting 0.18 s -> 2.2 s over 2700
+# cycles). It is a live-monitoring aid only -- the HDF5 results and profile.csv hold
+# all the data -- so turn it OFF for long production runs.
+dashboard: true
+
+changepoint_algo: "kernelcpd"
+changepoint_penalty: 0.01
 
 
 

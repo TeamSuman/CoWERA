@@ -210,6 +210,49 @@ Use `Analysis/WE_analysis.ipynb` to:
 3. Identify the converged regime (chignolin: ~6–7.5 ns; Trp-cage: ~23–74 ns) and
    block-average beyond it for the rate/MFPT and confidence intervals.
 
+> **Use the total simulated time in the denominator.** `T_total` in Eq. (7) is the
+> aggregate time actually simulated (`n_cycles × ΔT × num_walkers`), **not** the time
+> of the last recycling event. Time after the final event produced no flux but was
+> still simulated; omitting it inflates the rate (up to ~1.6× on runs whose last
+> event lands early). The notebook reports both conventions so the difference is
+> visible.
+
+> **Report the effective sample size with every rate.** The flux is a weighted sum
+> of rare events, so a run can accumulate many recycling events and still rest on a
+> handful of high-weight walkers. `Scripts/tools/mfpt_estimators.py` prints the Kish
+> ESS alongside the rate; treat an estimate with an ESS of only a few events as
+> preliminary regardless of how many events were recorded.
+
+### Run lengths and replicas
+
+The published runs used the following cycle counts (supplement, Table S1):
+
+| System / process | ΔT | cycles per run | replicas |
+|---|---|---|---|
+| Chignolin folding | 2 ps | 10 254 – 13 042 | 5 |
+| Chignolin unfolding | 10 ps | 2 227 – 2 274 | 5 |
+| Trp-cage folding | 100 ps | 997 – 1 053 | 5 |
+| Trp-cage unfolding | 50 ps | 621 – 626 | 5 |
+
+Chignolin folding in particular needs **≥10 000 cycles**; shorter runs are not
+converged. Always run **several independent replicas** — set a different `seed` and
+`run` label for each (`Scripts/tools/make_replica_config.py` generates them) — and
+block-average with `Scripts/tools/replica_stats.py`. A single run does not carry a
+meaningful confidence interval.
+
+### Settings that affect reproduction
+
+The defaults reproduce the published behaviour; these are the knobs that matter if
+you change them:
+
+| Option | Default | Note |
+|---|---|---|
+| `relevant_history_mode` | `published` | Reproduces the released phase-window guard. `strict` shortens the phase window and changes the resampling — do not use for reproduction. |
+| `merge_partner` | `random` | The published runs merged into a random eligible walker. `closest` samples more efficiently but can stall the ensemble on some seeds. |
+| `bin_increase_factor` / `bin_decrease_factor` | `1.2` / `0.8` | The values used by the released code. |
+| `changepoint_algo` | `kernelcpd` | The search used by the released code; `pelt` is far slower. |
+| `changepoint_window` | `1000` | Bounds the changepoint cost; expands adaptively, and was verified to give the same rate as the unbounded scan. |
+
 **Expected targets**
 
 | System | Process | Reference (unbiased MD) | CoWERA |
