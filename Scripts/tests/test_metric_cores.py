@@ -16,7 +16,147 @@ from cowera.metric import (
     scale_weights,
     compute_intensity,
     relevant_change_points,
+    euclidean_matrix_from_projections,
 )
+
+
+# ----------------- euclidean_matrix_from_projections (P3a) ------------------ #
+
+def _naive_distmat(projections):
+    """Reference: the pre-P3a per-pair norm the vectorized helper replaces."""
+    n = len(projections)
+    M = np.zeros((n, n))
+    for i in range(n):
+        for j in range(n):
+            M[i, j] = np.linalg.norm(np.asarray(projections[i], dtype=float)
+                                     - np.asarray(projections[j], dtype=float))
+    return M
+
+
+def test_euclidean_matrix_scalar_projections_matches_naive():
+    projs = [np.array([0.5]), np.array([0.2]), np.array([0.9]), np.array([0.55])]
+    M = euclidean_matrix_from_projections(projs)
+    assert np.allclose(M, _naive_distmat(projs))   # exact equivalence to old path
+    assert M[0, 1] == pytest.approx(0.3)           # |0.5 - 0.2|
+    assert np.allclose(np.diag(M), 0.0)            # self-distance
+    assert np.allclose(M, M.T)                     # symmetric
+
+
+def test_euclidean_matrix_multidim_projections_matches_naive():
+    # multi-D CV projections -> Euclidean norm over the CV dimensions
+    projs = [np.array([0.1, 0.2]), np.array([0.4, 0.6]), np.array([0.0, 1.0])]
+    M = euclidean_matrix_from_projections(projs)
+    assert np.allclose(M, _naive_distmat(projs))
+    assert M[0, 1] == pytest.approx(0.5)           # sqrt(0.3^2 + 0.4^2)
+
+
+def test_euclidean_matrix_plain_scalars():
+    # accepts a flat sequence of scalars too (ndim==1 path)
+    M = euclidean_matrix_from_projections([0.5, 0.2, 0.9])
+    assert M[0, 2] == pytest.approx(0.4)
+    assert np.allclose(np.diag(M), 0.0)
+
+
+def test_calculate_distances_deepcopy_excludes_mda_cache():
+    # Reproduces the Trp-cage end-of-run crash: a non-deep-copyable MDAnalysis
+    # Universe cached on the distance object must be dropped from copy/pickle.
+    import copy
+    from cowera.metric import Calculate_Distances
+
+    class _Uncopyable:
+        def __deepcopy__(self, memo):
+            raise RuntimeError("MDAnalysis-Universe-like: not deep-copyable")
+
+    cd = Calculate_Distances(feat="rmsd_backbone", increment=1,
+                             distance_criterion="pairwise_rmsd")
+    cd._mda_ref = _Uncopyable()
+    cd._mda_backbone = [1, 2, 3]
+    dup = copy.deepcopy(cd)                  # would raise if the cache weren't excluded
+    assert dup._mda_ref is None              # lazily rebuilt on next use
+    assert dup._mda_backbone is None
+    assert dup.distance_criterion == "pairwise_rmsd"   # everything else copied
+
+
+def test_changepoint_window_plumbing_and_short_signal_guard():
+    from cowera.metric import Calculate_Distances
+    # default is unbounded/exact; the option is stored
+    assert Calculate_Distances(feat="best_hummer_q", increment=1).changepoint_window is None
+    cd = Calculate_Distances(feat="best_hummer_q", increment=1, changepoint_window=200)
+    assert cd.changepoint_window == 200
+    # _detect_changes degrades to a single segment on a too-short signal (no ruptures
+    # needed, no crash) -> the last index only
+    assert list(cd._detect_changes(np.array([0.5, 0.6, 0.7]))) == [3]
+    assert list(cd._detect_changes(np.array([0.5]))) == [1]
+
+
+def test_adaptive_changepoint_window_finds_stable_last_changepoint(monkeypatch):
+    from cowera.metric import Calculate_Distances
+    # Fake detector: a single true changepoint 40 frames from the end. Small windows
+    # (<40) see no interior changepoint -> must expand; once the window contains it,
+    # the position is stable across a doubling -> accepted. Validates the loop logic
+    # (expansion + stability) without ruptures.
+    def fake_detect(projection):
+        n = len(projection)
+        cp = n - 40                       # 40 frames from the end
+        return np.array([cp, n]) if cp >= 2 else np.array([n])
+    cd = Calculate_Distances(feat="best_hummer_q", increment=1, changepoint_window=8)
+    # NB bind directly (no staticmethod wrapper): _detect_changes is an instance
+    # method now that it dispatches on self.changepoint_algo (kernelcpd vs pelt).
+    monkeypatch.setattr(cd, "_detect_changes", fake_detect)
+    proj = np.linspace(0.2, 0.8, 500)
+    drange = np.array([0.2, 0.8])
+    bins, phase, weight = cd.phase_from_projection(proj, drange, n_d=5, n_bins=122)
+    assert weight == pytest.approx(proj[-1])        # tail (current CV) preserved
+    assert np.isfinite(phase)
+
+
+# ---------------------- A2: incremental CV read dispatch --------------------- #
+
+def _cd(**kw):
+    from cowera.metric import Calculate_Distances
+    return Calculate_Distances(feat="best_hummer_q", increment=1, **kw)
+
+
+def test_a2_default_is_incremental():
+    # A2 verified exact on both feature paths -> incremental is the default.
+    assert _cd().incremental_cv_read is True
+
+
+def test_a2_disabled_uses_full_load():
+    cd = _cd(incremental_cv_read=False)           # explicit opt-out -> exact full load
+    cd._project_new_incremental = lambda i, p, o: (_ for _ in ()).throw(AssertionError("nope"))
+    cd._project_new_full = lambda i, p, o: (np.array([1.0]), np.array([0, 1]), 10, False)
+    assert cd.project_new_frames(0, "x/", 5)[0][0] == 1.0
+
+
+def test_a2_uses_incremental_when_enabled():
+    cd = _cd(incremental_cv_read=True)
+    cd._project_new_incremental = lambda i, p, o: (np.array([2.0]), np.array([0, 1]), 10, False)
+    cd._project_new_full = lambda i, p, o: (np.array([9.0]), np.array([0, 1]), 10, False)
+    assert cd.project_new_frames(0, "x/", 5)[0][0] == 2.0
+
+
+def test_a2_falls_back_to_full_on_error():
+    cd = _cd(incremental_cv_read=True)
+    def boom(i, p, o):
+        raise RuntimeError("mdtraj boom")
+    cd._project_new_incremental = boom
+    cd._project_new_full = lambda i, p, o: (np.array([9.0]), np.array([0, 1]), 10, False)
+    assert cd.project_new_frames(0, "x/", 5)[0][0] == 9.0        # correctness preserved
+
+
+def test_a2_verify_mismatch_returns_full():
+    cd = _cd(incremental_cv_read=True, verify_incremental_cv=True)
+    cd._project_new_incremental = lambda i, p, o: (np.array([0.1, 0.2]), np.array([0, 1]), 10, False)
+    cd._project_new_full = lambda i, p, o: (np.array([0.1, 0.9]), np.array([0, 1]), 10, False)
+    assert np.allclose(cd.project_new_frames(0, "x/", 5)[0], [0.1, 0.9])   # full (ref) wins
+
+
+def test_a2_verify_match_returns_incremental():
+    cd = _cd(incremental_cv_read=True, verify_incremental_cv=True)
+    cd._project_new_incremental = lambda i, p, o: (np.array([0.1, 0.2]), np.array([0, 1]), 10, False)
+    cd._project_new_full = lambda i, p, o: (np.array([0.1, 0.2]), np.array([0, 1]), 10, False)
+    assert np.allclose(cd.project_new_frames(0, "x/", 5)[0], [0.1, 0.2])
 
 
 # --------------------------- phase_from_bins -------------------------------- #
@@ -118,13 +258,29 @@ def test_relevant_change_points_single_changepoint():
     assert list(out) == [0, 7]
 
 
-def test_relevant_change_points_precedence_fix():
-    """Demonstrates the operator-precedence bug fix.
+def test_relevant_change_points_modes():
+    """The two phase-window guards are NOT equivalent -- pin both deliberately.
 
-    With changes=[1, 10] and n_d=5 the interior changepoint shifted back by n_d
-    is negative, so the fallback (no buffer) branch must be taken. The old code
-    ``np.all(changes[:-1] - n_d) > 0`` evaluated ``np.all(...)`` to a bool first
-    and compared that to 0, taking the wrong branch.
+    ``np.all(changes[:-1] - n_d) > 0`` (the released code, "published") evaluates
+    ``np.all(...)`` to a bool first and compares that to 0, so it is True unless an
+    interior changepoint equals n_d exactly: the n_d pre-transition buffer is applied
+    almost always, and the start index may go NEGATIVE (numpy then reads it as "the
+    last |x| frames"). ``np.all((changes[:-1] - n_d) > 0)`` ("strict") is the
+    arguably-intended reading but drops the buffer whenever an interior changepoint
+    <= n_d, giving a SHORTER window.
+
+    This was originally "fixed" to strict, which silently changed the resampling.
+    "published" is the default because it reproduces the manuscript; keep both pinned
+    so the difference can never be reintroduced by accident.
     """
-    out = relevant_change_points(changes=[1, 10], n_d=5)
-    assert list(out) == [0, 1, 10]
+    # published (default) -- keeps the buffer, negative start index and all
+    assert list(relevant_change_points(changes=[1, 10], n_d=5)) == [0, -4, 10]
+    assert list(relevant_change_points(changes=[1, 10], n_d=5,
+                                       mode="published")) == [0, -4, 10]
+    # strict -- falls back to the raw changepoints (shorter window)
+    assert list(relevant_change_points(changes=[1, 10], n_d=5,
+                                       mode="strict")) == [0, 1, 10]
+    # where every interior changepoint exceeds n_d the two agree
+    for mode in ("published", "strict"):
+        assert list(relevant_change_points(changes=[20, 60, 120], n_d=10,
+                                           mode=mode)) == [0, 10, 50, 120]

@@ -361,6 +361,13 @@ class Manager(object):
                    runner_opts=None,
     ):
         """See run_cycle."""
+        # True end-to-end cycle wall-clock start. The profiled `cycle_wall` was
+        # historically only runner+bc+resampling, which OMITS the reporting phase
+        # below (HDF5/pkl/dashboard/DCD) -- up to ~50% of the real wall for
+        # persistent workers. Measure the real thing here and hand it, plus a
+        # dedicated reporting-time bucket, to the TimingReporter (see the
+        # instrumented reporter loop at the end of this method).
+        cycle_start = time.time()
         if runner_opts is None:
             runner_opts = {}
 
@@ -516,8 +523,20 @@ class Manager(object):
                     for rep_key in self.REPORT_ITEM_KEYS])
 
         logging.info("Starting reporting")
-        # report results to the reporters
+        # Report to all reporters, TIMING the reporting phase (HDF5/pkl/dashboard/
+        # DCD I/O) which was previously unaccounted. Any reporter that consumes the
+        # cycle timing (the TimingReporter) must run LAST with the completed
+        # picture, so defer it and feed it reporting_time + the true cycle wall.
+        rep_start = time.time()
+        timing_reporters = []
         for reporter in self.reporters:
+            if getattr(reporter, "consumes_cycle_timing", False):
+                timing_reporters.append(reporter)
+                continue
+            reporter.report(**report)
+        report["cycle_reporting_time"] = time.time() - rep_start
+        report["cycle_true_wall"] = time.time() - cycle_start
+        for reporter in timing_reporters:
             reporter.report(**report)
 
         # prepare resampled walkers for running new state changes
@@ -727,19 +746,32 @@ class Manager(object):
     def run_simulation(self, n_cycles,
                        segment_lengths,
                        num_workers=None,
+                       start_cycle=0,
+                       continue_run=None,
     ):
         """Run a simulation for an explicit number of cycles.
 
         Parameters
         ----------
         n_cycles : int
-            Number of cycles to perform.
+            Number of cycles to perform (absolute; the loop runs cycle indices
+            ``start_cycle .. n_cycles-1``).
 
         segment_lengths : int
             The number of steps for each runner segment.
 
         num_workers : int
             The number of workers to use for the work mapper.
+             (Default value = None)
+
+        start_cycle : int
+            First cycle index to run. Non-zero when resuming a checkpointed run
+            so cycle indices stay contiguous across the restart.
+             (Default value = 0)
+
+        continue_run : int or None
+            Index of a prior run in the reporters (e.g. the HDF5 file) that this
+            run continues. Passed through to reporter ``init`` for linkage.
              (Default value = None)
 
 
@@ -760,16 +792,17 @@ class Manager(object):
 
         """
 
-        self.init(num_workers=num_workers)
+        self.init(num_workers=num_workers, continue_run=continue_run)
 
         if type(segment_lengths) == int:
             segment_lengths = [segment_lengths for _ in range(n_cycles)]
 
         walkers = self.init_walkers
 
-        # the main cycle loop
+        # the main cycle loop; resumes at ``start_cycle`` on restart so cycle
+        # indices remain contiguous across the checkpoint.
         with start_action(action_type="Simulation Loop") as simloop_cx:
-            for cycle_idx in range(n_cycles):
+            for cycle_idx in range(start_cycle, n_cycles):
 
                 walkers, filters = self.run_cycle(walkers, segment_lengths[cycle_idx], cycle_idx)
 

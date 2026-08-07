@@ -1,4 +1,5 @@
 import random as rand
+import time
 
 import logging
 from eliot import start_action, log_call
@@ -8,6 +9,7 @@ from wepy.resampling.resamplers.resampler import Resampler
 from wepy.resampling.resamplers.clone_merge  import CloneMergeResampler
 from wepy.resampling.decisions.clone_merge import MultiCloneMergeDecision
 from cowera.file_resampler import update_dcd_files
+from cowera.features import get_fallback_count
 
 class CoWERAResampler(CloneMergeResampler):
     r"""
@@ -53,6 +55,9 @@ class CoWERAResampler(CloneMergeResampler):
                  mode = "greedy",
                  use_cv_history = True,
                  history_window = None,
+                 bin_increase_factor = 1.2,
+                 bin_decrease_factor = 0.8,
+                 merge_partner = "random",
                  **kwargs):
 
         """Constructor for the REVO Resampler.
@@ -138,6 +143,44 @@ class CoWERAResampler(CloneMergeResampler):
         self.use_cv_history = use_cv_history
         self.history_window = history_window
         self._cv_history = None
+
+        # Adaptive-bin adjustment factors (paper Appendix F). Kept as attributes
+        # so they can be set from config; forwarded to both analysis paths.
+        self.bin_increase_factor = bin_increase_factor
+        self.bin_decrease_factor = bin_decrease_factor
+        # Which eligible walker (within D_merge of the squashed walker) to merge INTO.
+        # This is an EXPLORATION-vs-EFFICIENCY trade-off; measured both ways.
+        #
+        # "random" (DEFAULT) = uniformly random eligible walker. This is what the
+        #     released code (github.com/Shaheerah3007/CoWERA-1) used, so it is what
+        #     produced the published numbers, and it preserves ensemble diversity.
+        #
+        # "closest" = the NEAREST eligible walker, matching Appendix D's "nearby"
+        #     wording. Much better STATISTICS where it works -- paired same-seed runs:
+        #       chignolin  (n=3): +30% warps (41->54), worst Kish ESS 3.7->10.0
+        #       Trp-cage   (n=3): warps 89->222 and 4->127; ESS 23.0->52.8, 2.8->33.6;
+        #                         top1 0.43->0.05; steady-state CV 99.6%->6.7%
+        #     BUT it has a real FAILURE MODE: always merging into the nearest walker
+        #     erodes ensemble diversity, and on 1 of 3 Trp-cage seeds the ensemble
+        #     stalled short of the target and produced ZERO reactive events in 800
+        #     cycles (min distance 0.3493 vs a 0.30 cutoff), where the paired
+        #     random-merge run reached 0.2545 and got 70 warps. Weight conservation
+        #     was exact in both, so this is a sampling failure, not a bug.
+        #     => opt-in only, and monitor min-distance-to-target when using it.
+        self.merge_partner = merge_partner
+
+        # Most recent adaptive bin count returned by ``resample``. Snapshotted by
+        # the pickle/checkpoint reporter so a restarted run resumes with the same
+        # bin resolution instead of jumping back to the config's initial value.
+        self._last_n_bins = None
+
+        # Running total of feature-read fallbacks at the previous cycle, so we can
+        # report the per-cycle delta (a nonzero value flags CV corruption risk).
+        self._prev_fallback_count = 0
+
+        # Fine-grained resampling-analysis sub-timings from the last get_dist call
+        # (populated for the profiler; empty until the first resample).
+        self._last_subtimings = {}
 
         # we do not know the shape and dtype of the images until
         # runtime so we determine them here
@@ -241,7 +284,13 @@ class CoWERAResampler(CloneMergeResampler):
 
                 eligible = candidates[merge_mask[min_idx, candidates]]
                 if len(eligible) > 0:
-                    closewalk = self._rng.choice(eligible)
+                    if self.merge_partner == "closest":
+                        # Paper Appendix D: merge into a *nearby* walker -> take the
+                        # NEAREST eligible one (all are already within D_merge).
+                        closewalk = int(eligible[np.argmin(distance_matrix[min_idx, eligible])])
+                    else:
+                        # Historical behaviour: uniformly random eligible walker.
+                        closewalk = self._rng.choice(eligible)
 
             #print(f"Max idx: {max_idx}, Max var: {walker_variations[max_idx] if max_idx is not None else 'N/A'}, Min idx: {min_idx}, Min var: {walker_variations[min_idx] if min_idx is not None else 'N/A'}, Close walk: {closewalk}, min dist : {distance_matrix[min_idx, closewalk] if closewalk is not None else 'N/A'}")
             if min_idx is not None and max_idx is not None and closewalk is not None:
@@ -366,28 +415,56 @@ class CoWERAResampler(CloneMergeResampler):
 
     def get_dist(self, walkers, folder, n_d, it, n_bins, max_bins):
 
-        # Per-walker projection (image) onto the progress coordinate.
-        images = [self.distance.get_proj_coord(walker.state)[0] for walker in walkers]
+        # Per-walker projection (image) onto the progress coordinate. Project each
+        # walker's state ONCE and reuse it for both the images and the euclidean
+        # distance matrix below (the old path re-projected each state ~2(N-1) times
+        # inside image_distance -- ~N^2 expensive RMSD/Q evals per cycle).
+        _t0 = time.perf_counter()
+        projections = [self.distance.get_proj_coord(walker.state) for walker in walkers]
+        images = [p[0] for p in projections]
+        _t1 = time.perf_counter()
 
-        # Full symmetric pairwise distance matrix, computed in a single
-        # vectorized pass that reuses one cached topology/backbone selection
-        # (previously this constructed two MDAnalysis Universes for *every*
-        # walker pair, every cycle).
-        dist_mat = self.distance.pairwise_distance_matrix(walkers)
+        # Full symmetric pairwise distance matrix. For the euclidean criterion this
+        # reuses the projections above (O(N^2) scalar arithmetic, numerically
+        # identical); for pairwise_rmsd it does the real-space RMSD with one cached
+        # backbone selection.
+        dist_mat = self.distance.pairwise_distance_matrix(walkers, projections=projections)
+        _t2 = time.perf_counter()
 
         # Per-walker intensities + adaptive bin count.
+        _t2b = _t2
         if self.use_cv_history:
             # Disk-free analysis: consume the in-memory accumulated histories.
+            # NB: _update_cv_histories still md.load()s each walker's FULL DCD every
+            # cycle (only the projection of new frames is incremental) -> O(T) I/O
+            # that GROWS with the run. Timed separately as cv_update_time so it is
+            # not conflated with the changepoint (this is the A2 runner-inline-CV
+            # target, which the P3b demo showed dominates the old 'intensity' bucket).
             dranges = self._update_cv_histories(walkers, folder, n_d)
             projections = self._cv_history.as_list()
+            _t2b = time.perf_counter()
             dl, n_bins = self.distance.intensity_from_projections(
                 projections, dranges, n_d=n_d, it=it,
-                n_bins=n_bins, max_bins=max_bins)
+                n_bins=n_bins, max_bins=max_bins,
+                bin_increase_factor=self.bin_increase_factor,
+                bin_decrease_factor=self.bin_decrease_factor)
         else:
             # Legacy path: re-read and re-project each walker's full DCD.
             dl, n_bins = self.distance.intensity_calculation(
                 n_walkers=len(walkers), path=folder, n_d=n_d, it=it,
-                n_bins=n_bins, max_bins=max_bins)
+                n_bins=n_bins, max_bins=max_bins,
+                bin_increase_factor=self.bin_increase_factor,
+                bin_decrease_factor=self.bin_decrease_factor)
+        _t3 = time.perf_counter()
+
+        # Fine-grained resampling-analysis timings for the profiler (A0). Cheap;
+        # read by the timing reporter, ignored otherwise.
+        self._last_subtimings = {
+            'images_time': _t1 - _t0,       # per-walker projection of current state
+            'distmat_time': _t2 - _t1,      # O(N^2) pairwise distance matrix
+            'cv_update_time': _t2b - _t2,   # CV-history update incl. FULL DCD reload (A2 target)
+            'intensity_time': _t3 - _t2b,   # changepoint (P3b) + intensity/binning
+        }
 
         return dl, [row for row in dist_mat], images, n_bins
 
@@ -436,8 +513,14 @@ class CoWERAResampler(CloneMergeResampler):
         resampling_data, variation, happen = self.decide(walker_weights, num_walker_copies, distance_arr, distance_matrix,images)
 
 
+        # Per-cycle count of feature-read fallbacks (init-structure CV substituted
+        # for a walker). Nonzero flags possible CV/intensity corruption this cycle.
+        total_fallbacks = get_fallback_count()
+        cv_fallbacks = total_fallbacks - self._prev_fallback_count
+        self._prev_fallback_count = total_fallbacks
+
         file = open(f'{self.info_file_path}', 'a')
-        file.write(f'Cycle: {cycle_id}'+'\t'+f'Clst walk. proj: {cw_dist}'+'\t'+f'Resampling happend: {happen}'+'\t'+f'n_bins: {n_bins}'+'\n')
+        file.write(f'Cycle: {cycle_id}'+'\t'+f'Clst walk. proj: {cw_dist}'+'\t'+f'Resampling happend: {happen}'+'\t'+f'n_bins: {n_bins}'+'\t'+f'CV_fallbacks: {cv_fallbacks}'+'\n')
         file.close()
 
         # convert the target idxs and decision_id to feature vector arrays
@@ -465,5 +548,8 @@ class CoWERAResampler(CloneMergeResampler):
                            'variation' : np.array([variation]),
                            'images' : np.ravel(np.array(images)),
                            'image_shape' : np.array(images[0].shape)}]
+
+        # record the adaptive bin count for checkpointing/restart
+        self._last_n_bins = n_bins
 
         return resampled_walkers, resampling_data, resampler_data, n_bins

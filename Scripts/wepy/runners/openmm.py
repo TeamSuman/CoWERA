@@ -124,6 +124,9 @@ class OpenMMRunner(Runner):
                  platform_kwargs=None,
                  dcd_folder=None,
                  save_freq=1,
+                 random_seed=None,
+                 getState_kwargs=None,
+                 reuse_context=False,
                  enforce_box=False):
         """Constructor for OpenMMRunner.
 
@@ -190,6 +193,20 @@ class OpenMMRunner(Runner):
         self.integrator = integrator
         self.dcd_folder = dcd_folder
         self.save_freq = save_freq
+        # Optional base seed for deterministic per-segment integrator seeding. When
+        # None (default) the integrator seed is left at OpenMM's 0 (re-randomized
+        # each segment). Note: GPU MD is not bitwise reproducible even with a fixed
+        # seed, so this yields controlled-but-not-identical dynamics.
+        self.random_seed = random_seed
+
+        # EXPERIMENTAL (opt-in, default off): reuse a persistent OpenMM
+        # Simulation/Context per worker process instead of rebuilding it every
+        # segment (which recompiles kernels + re-uploads the system). Only useful
+        # with a persistent work mapper (WorkerMapper), where the runner instance
+        # lives across many run_segment calls in one process. Must be validated on
+        # a GPU host before use; the default path is unchanged.
+        self.reuse_context = reuse_context
+        self._sim_cache = {}
 
         # these are not SWIG objects
         self.topology = topology
@@ -199,6 +216,13 @@ class OpenMMRunner(Runner):
         self.enforce_box = enforce_box
 
         self.getState_kwargs = dict(GET_STATE_KWARG_DEFAULTS)
+        # Optionally override which state fields are pulled off the GPU each
+        # segment. By default GET_STATE_KWARG_DEFAULTS fetches everything
+        # (positions, velocities, forces, energy, parameters, derivatives); a
+        # caller that only saves positions/box can pass a trimmed dict here to
+        # cut GPU->CPU transfer per segment.
+        if getState_kwargs is not None:
+            self.getState_kwargs.update(getState_kwargs)
         # update with the user based enforce_box
         self.getState_kwargs['enforcePeriodicBox'] = self.enforce_box
 
@@ -289,6 +313,28 @@ class OpenMMRunner(Runner):
         return platform_name, \
                platform_kwargs,
 
+    def _build_simulation(self, platform_name, platform_kwargs, integrator):
+        """Construct an ``omma.Simulation`` for the given platform + integrator.
+
+        Extracted so both the default (fresh-per-segment) and the experimental
+        reuse_context (cached-per-worker) paths share identical build logic.
+        """
+        if platform_name is not None:
+            platform = omm.Platform.getPlatformByName(platform_name)
+            if platform_kwargs is None:
+                platform_kwargs = {}
+            for key, value in platform_kwargs.items():
+                if key in platform.getPropertyNames():
+                    logging.info(f"Setting platform property: {key} : {value}")
+                    platform.setPropertyDefaultValue(key, value)
+                else:
+                    warn(f"Platform kwargs given ({key} : {value}) "
+                         f"but is not valid for this platform ({platform_name})")
+            return omma.Simulation(self.topology, self.system, integrator, platform)
+        else:
+            logging.info("Using environmental platform.")
+            return omma.Simulation(self.topology, self.system, integrator)
+
     @log_call(
         include_args=[
             'segment_length',
@@ -370,10 +416,20 @@ class OpenMMRunner(Runner):
 
         # make a copy of the integrator for this particular segment
         new_integrator = copy(self.integrator)
-        # force setting of random seed to 0, which is a special
-        # value that forces the integrator to choose another
-        # random number
-        new_integrator.setRandomNumberSeed(0)
+        # By default seed 0 -- a special value that makes OpenMM choose a fresh
+        # random seed each segment. If a base random_seed was configured
+        # (deterministic_dynamics), derive a reproducible per-segment seed from
+        # (base, cycle, walker) instead so runs are controllable.
+        if self.random_seed is None:
+            seed_val = 0
+        else:
+            cycle_idx = kwargs.get('cycle_idx', 0) or 0
+            widx = walker_idx if walker_idx is not None else 0
+            derived = (int(self.random_seed) * 2654435761
+                       + int(cycle_idx) * 131071
+                       + int(widx)) % (2**31 - 1)
+            seed_val = derived if derived != 0 else 1
+        new_integrator.setRandomNumberSeed(seed_val)
 
         ## Platform
 
@@ -409,47 +465,27 @@ class OpenMMRunner(Runner):
 
 
 
-        # create simulation object
-
-        ## create the platform and customize
-
-
-
-        # if a platform was given we use it to make a Simulation object
-        if platform_name is not None:
-
-            logging.info("Using platform configured in code.")
-
-            # get the platform by its name to use
-            platform = omm.Platform.getPlatformByName(platform_name)
-            logging.info(f"Platform object created: {platform}")
-
-            if platform_kwargs is None:
-                platform_kwargs = {}
-
-            # set properties from the kwargs if they apply to the platform
-            for key, value in platform_kwargs.items():
-
-                if key in platform.getPropertyNames():
-
-                    logging.info(f"Setting platform property: {key} : {value}")
-                    platform.setPropertyDefaultValue(key, value)
-
-                else:
-                    warn(f"Platform kwargs given ({key} : {value}) "
-                         f"but is not valid for this platform ({platform_name})")
-
-            # make a new simulation object
-            simulation = omma.Simulation(self.topology, self.system,
-                                         new_integrator, platform)
-
-        # otherwise just use the default or environmentally defined one
+        # create simulation object (fresh per segment by default; reused per
+        # worker process when reuse_context is enabled).
+        if self.reuse_context:
+            # One persistent Context per (process, platform, device). Built once
+            # inside the worker (never in the parent -- important for CUDA+fork),
+            # then only setState -> step -> getState each segment.
+            device = str(platform_kwargs.get('DeviceIndex')) if platform_kwargs else None
+            cache_key = (os.getpid(), platform_name, device)
+            simulation = self._sim_cache.get(cache_key)
+            if simulation is None:
+                simulation = self._build_simulation(
+                    platform_name, dict(platform_kwargs) if platform_kwargs else None,
+                    copy(self.integrator))
+                self._sim_cache[cache_key] = simulation
+                logging.info(f"Built and cached OpenMM Context for {cache_key}")
+            # re-seed the persistent integrator for this segment's stochasticity
+            simulation.integrator.setRandomNumberSeed(seed_val)
         else:
-            logging.info("Using environmental platform.")
-            simulation = omma.Simulation(self.topology, self.system,
-                                         new_integrator)
-
-
+            simulation = self._build_simulation(
+                platform_name, dict(platform_kwargs) if platform_kwargs else None,
+                new_integrator)
 
         dcd_path = os.path.join(self.dcd_folder, f"walker_{walker_idx}.dcd")
         if os.path.exists(dcd_path):

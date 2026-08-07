@@ -4,6 +4,7 @@ import os, sys
 import os.path as osp
 import shutil
 import time
+import pickle
 
 sys.path.append(os.path.abspath("Scripts/"))
 sys.path.append(os.path.abspath("Systems/"))
@@ -15,14 +16,20 @@ import simtk.unit as unit
 import mdtraj as mdj
 
 import warnings
-warnings.filterwarnings("ignore")
+# Silence only the noisy third-party deprecation/future chatter, NOT UserWarnings.
+# CoWERA's feature functions surface trajectory-read fallbacks (which substitute the
+# initial structure's CV and can bias resampling) via logging.warning -> dashboard.log;
+# a blanket filterwarnings("ignore") previously hid those entirely.
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-from wepy.runners.openmm import OpenMMGPUWalkerTaskProcess, OpenMMRunner, OpenMMWalker, OpenMMState, gen_sim_state
+from wepy.runners.openmm import OpenMMGPUWalkerTaskProcess, OpenMMCPUWalkerTaskProcess, OpenMMGPUWorker, OpenMMRunner, OpenMMWalker, OpenMMState, gen_sim_state
 from wepy.reporter.hdf5 import WepyHDF5Reporter
 from wepy.work_mapper.task_mapper import TaskMapper
+from wepy.work_mapper.mapper import WorkerMapper
 from wepy.util.mdtraj import mdtraj_to_json_topology
 
-from walker_pkl_reporter import WalkersPickleReporter
+from walker_pkl_reporter import WalkersPickleReporter, latest_checkpoint
 
 from wepy.reporter.dashboard import DashboardReporter
 from wepy.reporter.openmm import OpenMMRunnerDashboardSection
@@ -36,6 +43,7 @@ from cowera.metric import Calculate_Distances
 from cowera.resampler import CoWERAResampler
 from cowera.warper import TargetBC
 from cowera.sim_manager import Manager
+from cowera.timing_reporter import TimingReporter
 
 import yaml
 import argparse
@@ -47,6 +55,9 @@ import importlib.util
 def get_args():
     parser = argparse.ArgumentParser(description="Run CoWERA simulation.")
     parser.add_argument("--config", type=str, help="Path to YAML input file.")
+    parser.add_argument("--restart", action="store_true",
+                        help="Resume from the newest checkpoint in the output "
+                             "directory instead of starting a fresh run.")
     args_cli = parser.parse_args()
 
     if args_cli.config:
@@ -59,6 +70,14 @@ def get_args():
     else:
         raise ValueError("Please provide a configuration file using --config")
 
+    # Restart may be requested on the CLI or in the config file.
+    args.restart = bool(args_cli.restart or getattr(args, "restart", False))
+
+    # ``gpu_ids`` is optional for CPU/Reference execution; default to an empty
+    # list so len()/derived parameters stay well-defined.
+    if not hasattr(args, "gpu_ids") or args.gpu_ids is None:
+        args.gpu_ids = []
+
     # Derived parameters (same as before)
     args.n_gpu = len(args.gpu_ids)
     args.n_d = args.n_steps // args.save_freq
@@ -66,14 +85,18 @@ def get_args():
     return args
 
 
-# Optional: colored terminal output
+# Optional: colored terminal output. Never install packages at runtime (compute
+# nodes are often offline / read-only); fall back to a no-op color shim instead.
 try:
     from colorama import Fore, Style, init
     init(autoreset=True)
 except ImportError:
-    os.system("pip install colorama")
-    from colorama import Fore, Style, init
-    init(autoreset=True)
+    class _NoColor:
+        def __getattr__(self, _name):
+            return ""
+    Fore = Style = _NoColor()
+    def init(*args, **kwargs):
+        pass
 
 # -------------------- Parse args -------------------- #
 args = get_args()
@@ -104,6 +127,44 @@ output_folder  = args.output_folder
 pmax           = args.pmax
 mode           = args.mode
 distance_criterion = args.distance_criterion
+
+# Compute platform selection (default CUDA preserves prior behaviour). Non-CUDA
+# platforms (CPU/Reference/OpenCL) let CoWERA run on CPU-only HPC nodes.
+restart        = args.restart
+checkpoint_freq = getattr(args, "checkpoint_freq", 10)
+# scratch_dir: stage hot I/O (trajectory DCDs) on node-local disk instead of NFS
+# $HOME -- NFS write latency spikes MD cycles (~27%->7% on solaris). Expand env
+# vars so a config can use a per-job, collision-free path like
+# "/tmp/$USER/cowera_$PBS_JOBID"; trajectories are synced back to $HOME at the end.
+scratch_dir    = getattr(args, "scratch_dir", None)
+if scratch_dir:
+    scratch_dir = os.path.expandvars(scratch_dir)
+seed           = getattr(args, "seed", None)
+deterministic_dynamics = getattr(args, "deterministic_dynamics", False)
+profile        = getattr(args, "profile", False)
+# Reporters save only positions + box_vectors; velocities are retained for state
+# fidelity across clone/merge/warp. Forces/energy/parameters/derivatives are
+# fetched every segment but discarded, so trim them by default to cut GPU->CPU
+# transfer. Config `getstate_kwargs` can override (e.g. to keep forces).
+_DEFAULT_GETSTATE = {'getPositions': True, 'getVelocities': True,
+                     'getForces': False, 'getEnergy': False,
+                     'getParameters': False, 'getParameterDerivatives': False}
+getstate_kwargs = getattr(args, "getstate_kwargs", None) or _DEFAULT_GETSTATE
+platform_name  = getattr(args, "platform", "CUDA")
+platform_kwargs = getattr(args, "platform_kwargs", None)
+# EXPERIMENTAL (default off): persistent per-GPU workers with a cached OpenMM
+# Context, instead of forking a process + rebuilding the Context every walker
+# every cycle. Big multi-GPU speedup, but must be validated on a GPU host.
+persistent_workers = getattr(args, "persistent_workers", False)
+_GPU_PLATFORMS = ("CUDA", "OpenCL")
+is_gpu_platform = platform_name in _GPU_PLATFORMS
+# Number of concurrent walker worker processes. For GPU platforms this is the
+# number of device slots (len(gpu_ids), repeated ids => MPS packing); for CPU it
+# is an explicit ``n_workers`` (default: 1, or n_gpu if that was set).
+if is_gpu_platform:
+    num_workers = n_gpu
+else:
+    num_workers = getattr(args, "n_workers", None) or (n_gpu if n_gpu > 0 else 1)
 
 # Determine folding or unfolding and set target behavior
 
@@ -156,6 +217,8 @@ def flashy_banner():
     print(f"{Fore.MAGENTA}{Style.BRIGHT}Temperature:      {Fore.WHITE}{temp} K")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}Walkers:          {Fore.WHITE}{num_walkers}")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}Max Walker Prob:  {Fore.WHITE}{pmax}")
+    print(f"{Fore.MAGENTA}{Style.BRIGHT}Platform:         {Fore.WHITE}{platform_name}")
+    print(f"{Fore.MAGENTA}{Style.BRIGHT}Workers:          {Fore.WHITE}{num_workers}")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}GPUs:             {Fore.WHITE}{gpu_ids}  (Total: {n_gpu})")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}Steps per cycle:  {Fore.WHITE}{n_steps}")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}Total cycles:     {Fore.WHITE}{n_cycles}")
@@ -189,29 +252,82 @@ if __name__ == "__main__":
 
     outputs_dir = f'{inp_path}/{output_folder}/simdata_run{run}_steps{n_steps}_cycs{n_cycles}'
 
-    # If the folder exists, rename it with a timestamp
-    if os.path.exists(outputs_dir):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_name = f"{outputs_dir}_backup_{timestamp}"
-        shutil.move(outputs_dir, backup_name)
-        os.makedirs(outputs_dir)
+    if restart:
+        # Resume: reuse the existing output directory in place. Never move it
+        # aside or clear it, so trajectories, results and checkpoints survive.
+        if not os.path.exists(outputs_dir):
+            raise FileNotFoundError(
+                f"--restart given but no existing output directory to resume: {outputs_dir}"
+            )
+        print(f"{Fore.YELLOW}{Style.BRIGHT}>>> RESTART: resuming run in {outputs_dir}")
     else:
+        # Fresh run: if the folder exists, rename it with a timestamp backup.
+        if os.path.exists(outputs_dir):
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_name = f"{outputs_dir}_backup_{timestamp}"
+            shutil.move(outputs_dir, backup_name)
         os.makedirs(outputs_dir)
-    #os.makedirs(outputs_dir, exist_ok=True)
 
     info_file_path = f'{outputs_dir}/Info_{run}.txt'
 
-    # If the file exists, delete it
-    if os.path.exists(info_file_path):
-        os.remove(info_file_path)
-
-    # Create a new empty file
-    open(info_file_path, 'w').close()
+    # On a fresh run start with an empty Info file; on restart append to the
+    # existing one so the per-cycle log stays contiguous across the checkpoint.
+    if not restart:
+        if os.path.exists(info_file_path):
+            os.remove(info_file_path)
+        open(info_file_path, 'w').close()
+    elif not os.path.exists(info_file_path):
+        open(info_file_path, 'w').close()
 
     #select folder for dcd files
-    dcd_folder = f'{outputs_dir}/trajectories/'
+    final_dcd_folder = f'{outputs_dir}/trajectories/'
+    os.makedirs(final_dcd_folder, exist_ok=True)
 
-    os.makedirs(dcd_folder, exist_ok=True)
+    # Node-local scratch for the high-churn per-cycle DCD I/O (read/append/copy/
+    # remove) -- on fast local disk instead of a shared/NFS output filesystem, which
+    # those small ops otherwise hammer (NFS write latency stalled ~27% of MD cycles;
+    # local scratch dropped that to ~7%). The user names the compute-node scratch
+    # path via `scratch_dir` in the input file. It is used ONLY IF available AND
+    # writable on this node; otherwise we fall back to writing trajectories in the
+    # output dir (the PBS working directory) -- so a config naming a scratch path
+    # stays portable across nodes/clusters that lack it, and a bad path never aborts
+    # the run. Durable checkpoints (pkls/) + results (h5) always stay on the output
+    # dir so restarts work; trajectories are synced back from scratch on exit.
+    dcd_folder = final_dcd_folder          # default: output dir == PBS working dir
+    if scratch_dir:
+        _node = os.uname().nodename
+        candidate = osp.join(scratch_dir,
+                             f'cowera_run{run}_steps{n_steps}_cycs{n_cycles}',
+                             'trajectories') + os.sep
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            _probe = osp.join(candidate, '.cowera_write_probe')     # confirm writable
+            open(_probe, 'w').close()
+            os.remove(_probe)
+        except Exception as exc:
+            print(f"{Fore.YELLOW}scratch_dir {scratch_dir!r} not available/writable "
+                  f"on {_node} ({exc}); writing trajectories to the output dir "
+                  f"({final_dcd_folder}) instead.")
+        else:
+            dcd_folder = candidate
+            # On restart, re-stage previously synced trajectories to scratch so the
+            # in-memory CV histories can rebuild from them.
+            if restart:
+                for fname in os.listdir(final_dcd_folder):
+                    shutil.copy(osp.join(final_dcd_folder, fname), osp.join(dcd_folder, fname))
+
+            def _sync_trajectories_back():
+                try:
+                    os.makedirs(final_dcd_folder, exist_ok=True)
+                    for fname in os.listdir(dcd_folder):
+                        shutil.copy(osp.join(dcd_folder, fname), osp.join(final_dcd_folder, fname))
+                    print(f"Synced trajectories from scratch -> {final_dcd_folder}")
+                except Exception as exc:
+                    print(f"Warning: failed to sync trajectories from scratch ({exc}).")
+
+            import atexit
+            atexit.register(_sync_trajectories_back)
+            print(f"{Fore.CYAN}Trajectories staged on node-local scratch: {dcd_folder} (node {_node})")
 
 
     system_file = os.path.join(inp_path, "system.py")
@@ -284,8 +400,18 @@ if __name__ == "__main__":
     new_simtk_state = gen_sim_state(pos, system, integrator)
     #target_state = gen_sim_state(tar_pos, system, integrator)
 
-    # set up the OpenMMRunner with your system
-    runner = OpenMMRunner(system, top.topology, integrator, platform='CUDA',dcd_folder=dcd_folder, save_freq=save_freq)
+    # set up the OpenMMRunner with your system. random_seed (only when
+    # deterministic_dynamics is requested) makes the per-segment integrator seed a
+    # deterministic function of (seed, cycle, walker) instead of OpenMM's default 0
+    # (which re-randomizes each segment).
+    # Context reuse only helps with a persistent mapper (WorkerMapper); with the
+    # default process-per-task mapper each process dies after one segment.
+    use_persistent = persistent_workers and is_gpu_platform
+    runner = OpenMMRunner(system, top.topology, integrator, platform=platform_name,
+                          platform_kwargs=platform_kwargs, dcd_folder=dcd_folder, save_freq=save_freq,
+                          random_seed=(seed if deterministic_dynamics else None),
+                          getState_kwargs=getstate_kwargs,
+                          reuse_context=use_persistent)
 
     # Select the feature
     sel_feat = sel_feat
@@ -358,13 +484,74 @@ if __name__ == "__main__":
     walker_state = OpenMMState(new_simtk_state)
     #target_walker_state = OpenMMState(target_state)
 
-    # Make a list of the initial walkers
-    init_walkers = [OpenMMWalker(walker_state, init_weight) for i in range(num_walkers)]
+    # --------------------- Restart bookkeeping --------------------- #
+    # Defaults for a fresh run; overwritten below when resuming.
+    start_cycle = 0
+    continue_run = None
+    restored_n_bins = None
+    pkl_dir = osp.join(outputs_dir, 'pkls')
 
+    if restart:
+        ckpt = latest_checkpoint(pkl_dir)
+        if ckpt is None:
+            raise FileNotFoundError(
+                f"--restart given but no complete checkpoint found in {pkl_dir}"
+            )
+        walkers_path, meta_path, ckpt_cycle = ckpt
+        with open(walkers_path, 'rb') as f:
+            init_walkers = pickle.load(f)
+        with open(meta_path, 'rb') as f:
+            meta = pickle.load(f)
+        start_cycle = ckpt_cycle + 1
+        restored_n_bins = meta.get('n_bins')
+        print(f"{Fore.YELLOW}{Style.BRIGHT}>>> Resuming from cycle {ckpt_cycle} "
+              f"(next cycle {start_cycle}), n_bins={restored_n_bins}")
+        if start_cycle >= n_cycles:
+            print(f"{Fore.GREEN}{Style.BRIGHT}Checkpoint already at/after n_cycles; nothing to do.")
+            sys.exit(0)
+    else:
+        # Make a list of the initial walkers
+        init_walkers = [OpenMMWalker(walker_state, init_weight) for i in range(num_walkers)]
+
+
+    # I0 form and phase usage (paper Appendix C). Defaults reproduce CoWERA;
+    # i0_mode='uniform' and/or use_phase=false reproduce the paper's baselines.
+    i0_mode = getattr(args, "i0_mode", "projection")
+    use_phase = getattr(args, "use_phase", True)
+    # P3b: bound the per-cycle changepoint detection to the most recent
+    # `changepoint_window` CV frames. DEFAULT 1000 (was None/unbounded): with an
+    # unbounded window KernelCPD re-scans the whole growing CV history every cycle,
+    # which is O(T^2) -- measured growing from 0.1 s to 4.6 s/cycle over 1500 cycles
+    # and dragging the cycle from 3 s to 8.6 s. The windowed detector is
+    # exact-by-construction (it expands until the last changepoint is stable across a
+    # doubling, up to the full history), and a paired same-seed run confirmed it is
+    # rate-identical: 0.6563 vs 0.6651 x1e7 s^-1 (~1.3%) at ~4.6x lower cost.
+    # Set explicitly to null to restore the unbounded scan.
+    changepoint_window = getattr(args, "changepoint_window", 1000)
+    # A2: read only new DCD frames each cycle instead of md.load()ing the whole
+    # trajectory. ON by default -- verified bit-identical to the full load on both
+    # feature paths (best_hummer_q + rmsd_backbone), and it falls back to the full
+    # load on any error. verify_incremental_cv asserts equivalence (validation).
+    incremental_cv_read = getattr(args, "incremental_cv_read", True)
+    verify_incremental_cv = getattr(args, "verify_incremental_cv", False)
+    # D-2: paper (Appendix B) specifies PELT; the code historically hardcoded
+    # KernelCPD + an undocumented penalty 0.01. Both now selectable.
+    changepoint_algo = getattr(args, "changepoint_algo", "kernelcpd")
+    changepoint_penalty = getattr(args, "changepoint_penalty", 0.01)
+    # Phase-window guard: "published" reproduces the released code / manuscript
+    # numbers; "strict" avoids the negative-index wraparound but shortens the window.
+    relevant_history_mode = getattr(args, "relevant_history_mode", "published")
 
     # Distance metric to be used in resampling
     proj_distance = Calculate_Distances(sel_feat, increment=increment, native_file=native_path, init_file=start_path,
-                                        tar_file=tar_path, top_file=native_path, distance_criterion=distance_criterion)
+                                        tar_file=tar_path, top_file=native_path, distance_criterion=distance_criterion,
+                                        i0_mode=i0_mode, use_phase=use_phase,
+                                        changepoint_window=changepoint_window,
+                                        incremental_cv_read=incremental_cv_read,
+                                        verify_incremental_cv=verify_incremental_cv,
+                                        changepoint_algo=changepoint_algo,
+                                        changepoint_penalty=changepoint_penalty,
+                                        relevant_history_mode=relevant_history_mode)
 
     #init_rmsd = proj_distance.image_distance(walker_state, target_walker_state)
     #print(f"Initial rmsd distance from target: {init_rmsd}")
@@ -390,6 +577,20 @@ if __name__ == "__main__":
     # defaults keep existing config files working unchanged).
     use_cv_history = getattr(args, "use_cv_history", True)
     history_window = getattr(args, "history_window", None)
+    # Adaptive-bin adjustment factors (paper Appendix F). Defaults preserve the
+    # existing code behaviour (1.2 / 0.8). NOTE (decision D-1): the manuscript
+    # states 1.5 / 0.75 -- set these explicitly to reproduce the paper text.
+    bin_increase_factor = getattr(args, "bin_increase_factor", 1.2)
+    bin_decrease_factor = getattr(args, "bin_decrease_factor", 0.8)
+    # Which eligible walker (within D_merge) a squashed walker is merged INTO.
+    # Which eligible walker (within D_merge) a squashed walker is merged INTO.
+    # DEFAULT "random": what the released code used (hence the published numbers), and
+    # it preserves ensemble diversity. "closest" matches Appendix D's "nearby" wording
+    # and gives much better statistics where it works (Trp-cage paired: warps 89->222
+    # and 4->127, ESS 23->53 and 2.8->34, steady-state CV 99.6%->6.7%), BUT on 1 of 3
+    # Trp-cage seeds it stalled short of the target and produced ZERO reactive events
+    # (min dist 0.3493 vs 0.30 cutoff) where random-merge got 70. Opt-in only.
+    merge_partner = getattr(args, "merge_partner", "closest")
 
     # Set up the Resampler with the parameters
     resampler = CoWERAResampler(distance=proj_distance,
@@ -402,8 +603,12 @@ if __name__ == "__main__":
                               dcd_folder=dcd_folder,
                               pmax=pmax,
                               mode=mode,
+                              seed=seed,
                               use_cv_history=use_cv_history,
-                              history_window=history_window)
+                              history_window=history_window,
+                              bin_increase_factor=bin_increase_factor,
+                              bin_decrease_factor=bin_decrease_factor,
+                              merge_partner=merge_partner)
 
     # Set up the boundary conditions for a non-eq ensemble
     tbc = TargetBC(cutoff_distance=d_warped,
@@ -417,43 +622,98 @@ if __name__ == "__main__":
                     top_file=native_path
                     )
 
-    #output_dir = '/home/suman/Shaheerah/WeTICA/Systems/TC10b Trp-cage/simdata_run0_steps10000_cycs20000'
-    #os.makedirs(output_dir, exist_ok=True)
-    # Set up the HDF5 reporter
+    # Set up the HDF5 reporter. A fresh run creates the file (mode 'x'); a
+    # restart opens the existing file (mode 'r+') and links a new run as a
+    # continuation of the last one (continue_run) so analysis can follow it.
+    h5_path = osp.join(outputs_dir, 'wepy.results.h5')
+    hdf5_mode = 'x'
+    if restart:
+        hdf5_mode = 'r+'
+        try:
+            from wepy.hdf5 import WepyHDF5
+            with WepyHDF5(h5_path, mode='r') as _probe:
+                run_idxs = list(_probe.run_idxs)
+            continue_run = max(run_idxs) if run_idxs else None
+        except Exception as exc:
+            logging.warning(f"Could not read existing runs from {h5_path} ({exc}); "
+                            "continuing as an unlinked run.")
+            continue_run = None
+
     hdf5_reporter = WepyHDF5Reporter(save_fields=('positions','box_vectors'),
-                                file_path=osp.join(outputs_dir,f'wepy.results.h5') ,
+                                file_path=h5_path,
+                                mode=hdf5_mode,
                                 resampler=resampler,
                                 boundary_conditions=tbc,
                                 topology=json_top)
 
-    # Set up the pickle reporter (Essential for restarts)
-    out_folder_pkl = osp.join(outputs_dir,f'pkls')
+    # Set up the pickle/checkpoint reporter (enables --restart). Keep existing
+    # checkpoints on restart so the one that seeded this run is not wiped.
+    out_folder_pkl = pkl_dir
     pkl_reporter = WalkersPickleReporter(save_dir = out_folder_pkl,
-                                      freq = 1,
-                                      num_backups = 2)
+                                      freq = checkpoint_freq,
+                                      num_backups = 2,
+                                      wipe_on_init = not restart)
 
-    # Set up the dashboard reporter
-    dashboard_path = osp.join(outputs_dir,f'wepy.dash.org')
-    openmm_dashboard_sec = OpenMMRunnerDashboardSection(runner)
-    dashboard_reporter = DashboardReporter(file_path = dashboard_path,
-                                        runner_dash = openmm_dashboard_sec)
+    # Set up the dashboard reporter (live wepy.dash.org). NB: it appends per-cycle
+    # stats to growing lists and recomputes running means over the FULL history every
+    # cycle -> O(T) reporting cost that grows without bound on long runs (measured:
+    # reporting 0.18 s -> 2.2 s over 2700 cycles). It is a live-monitoring aid only --
+    # the HDF5 results + profile.csv hold all the data -- so it can be turned off for
+    # long production runs via `dashboard: false` (default on for interactive use).
+    enable_dashboard = getattr(args, "dashboard", True)
+    dashboard_reporter = None
+    if enable_dashboard:
+        dashboard_path = osp.join(outputs_dir,f'wepy.dash.org')
+        openmm_dashboard_sec = OpenMMRunnerDashboardSection(runner)
+        dashboard_reporter = DashboardReporter(file_path = dashboard_path,
+                                            runner_dash = openmm_dashboard_sec)
 
 
-    # Create a work mapper for NVIDIA GPUs for a GPU cluster
-    mapper = TaskMapper(walker_task_type=OpenMMGPUWalkerTaskProcess,
-                        num_workers=n_gpu,
-                        platform='CUDA',
-                        device_ids=gpu_ids)
+    # Create a work mapper. GPU platforms (CUDA/OpenCL) assign a device per worker
+    # slot via DeviceIndex; CPU/Reference platforms use a device-agnostic task type.
+    if is_gpu_platform:
+        if not gpu_ids:
+            raise ValueError(
+                f"platform '{platform_name}' requires a non-empty 'gpu_ids' list in the config."
+            )
+        if use_persistent:
+            # Persistent long-lived worker per device slot; the runner caches its
+            # OpenMM Context so each segment is just setState -> step -> getState.
+            print(f"{Fore.YELLOW}{Style.BRIGHT}>>> Using persistent per-GPU workers "
+                  f"(cached Context) [EXPERIMENTAL]")
+            mapper = WorkerMapper(worker_type=OpenMMGPUWorker,
+                                  num_workers=num_workers,
+                                  platform=platform_name,
+                                  device_ids=gpu_ids)
+        else:
+            mapper = TaskMapper(walker_task_type=OpenMMGPUWalkerTaskProcess,
+                                num_workers=num_workers,
+                                platform=platform_name,
+                                device_ids=gpu_ids)
+    else:
+        mapper = TaskMapper(walker_task_type=OpenMMCPUWalkerTaskProcess,
+                            num_workers=num_workers,
+                            platform=platform_name)
 
 
-    # Build the simulation manager
+    # Assemble reporters; add the per-cycle timing profiler when profile: true.
+    reporters = [hdf5_reporter, pkl_reporter]
+    if dashboard_reporter is not None:
+        reporters.append(dashboard_reporter)
+    if profile:
+        reporters.append(TimingReporter(save_path=osp.join(outputs_dir, 'profile.csv')))
+        print(f"{Fore.CYAN}Profiling enabled -> {osp.join(outputs_dir, 'profile.csv')}")
+
+    # Build the simulation manager. On restart resume the adaptive bin count
+    # snapshotted in the checkpoint so the bin resolution stays continuous.
+    active_n_bins = restored_n_bins if (restart and restored_n_bins is not None) else n_bins
     sim_manager = Manager(init_walkers,
                           runner=runner,
                           resampler=resampler,
                           boundary_conditions=tbc,
                           work_mapper=mapper,
-                          reporters=[hdf5_reporter, pkl_reporter, dashboard_reporter],
-                          n_bins=n_bins,
+                          reporters=reporters,
+                          n_bins=active_n_bins,
                           max_bins = max_bins,
                           outputs_dir=outputs_dir
                           )
@@ -471,9 +731,11 @@ if __name__ == "__main__":
     steps_list = [n_steps for i in range(n_cycles)]
 
 
-    # and..... go!
+    # and..... go!  (start_cycle/continue_run are non-trivial only on restart)
     sim_manager.run_simulation(n_cycles,
-                                steps_list)
+                                steps_list,
+                                start_cycle=start_cycle,
+                                continue_run=continue_run)
 
     print(f"{Fore.GREEN}{Style.BRIGHT}\n✅ Simulation complete! Results saved in:\n{Fore.WHITE}{outputs_dir}\n")
     print(f"{Fore.CYAN}{'=' * 62}{Style.RESET_ALL}")

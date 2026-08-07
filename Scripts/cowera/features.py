@@ -1,7 +1,19 @@
+import logging
 import warnings
 from itertools import combinations
 
 import numpy as np
+
+# Count of feature-read fallbacks to the initial structure. Each fallback silently
+# substitutes the init-structure CV for a walker (e.g. a transiently unreadable /
+# just-warped DCD), which can bias resampling -- so we count them and the resampler
+# surfaces a per-cycle delta in Info_*.txt instead of hiding it behind a warning.
+_FALLBACK_COUNT = 0
+
+
+def get_fallback_count():
+    """Return the cumulative number of feature-read fallbacks to the init structure."""
+    return _FALLBACK_COUNT
 
 # mdtraj is only required for the file/trajectory based code paths. Import it
 # lazily so that the pure-numpy cores (e.g. ``compute_q``) remain importable and
@@ -159,8 +171,11 @@ def best_hummer_q(traj, native_file=None, init_file=None, tar_file=None, frame_r
         # that genuine errors surface instead of being silently masked.
         if init_file is None or (isinstance(traj, str) and traj == init_file):
             raise
-        warnings.warn(
-            f"best_hummer_q failed for {traj!r} ({e}); falling back to init_file."
+        global _FALLBACK_COUNT
+        _FALLBACK_COUNT += 1
+        logging.warning(
+            "best_hummer_q failed for %r (%s); falling back to init_file "
+            "(the initial-structure CV is substituted for this walker).", traj, e
         )
         return best_hummer_q(init_file, native_file=native_file, frame_range=frame_range)
 
@@ -249,8 +264,11 @@ def RMSD_Backbone(traj, top_file=None, init_file=None, unfolded_file=None):
         # Single, well-defined fallback (see best_hummer_q for rationale).
         if init_file is None or (isinstance(traj, str) and traj == init_file):
             raise
-        warnings.warn(
-            f"RMSD_Backbone failed for {traj!r} ({e}); falling back to init_file."
+        global _FALLBACK_COUNT
+        _FALLBACK_COUNT += 1
+        logging.warning(
+            "RMSD_Backbone failed for %r (%s); falling back to init_file "
+            "(the initial-structure CV is substituted for this walker).", traj, e
         )
         return RMSD_Backbone(init_file, top_file=top_file, init_file=init_file,
                              unfolded_file=unfolded_file)
